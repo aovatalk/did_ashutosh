@@ -205,8 +205,14 @@ database schema and dialplan are left unchanged; remove the optimizer line
 from the VICIdial carrier Dialplan Entry and rebuild/reload the dialplan
 separately.
 
-There is no `--role database` uninstall path — dropping the shared schema is a
-manual, deliberate action against the database node.
+```bash
+sudo ./uninstall.sh --role database --purge-data
+```
+
+Drops the shared optimizer tables. Requires the explicit `--purge-data` flag
+and typing `DROP asterisk` at the confirmation prompt; anything else cancels
+the purge. Irreversible — deployed dialer/web files and the dialplan are left
+unchanged.
 
 The NPA-NXX dataset is redistributed by the original DID Optimizer project
 from [djbelieny/geoinfo-dataset](https://github.com/djbelieny/geoinfo-dataset)
