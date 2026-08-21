@@ -375,7 +375,9 @@ printf '%s\n' \
     '' \
     'Add to the h extension on the same route(s) - required for DID scores to' \
     'ever update; without it, selection falls back to ordering by last_used only:' \
-    ' exten => h,1,AGI(did_optimizer_hangup.agi,${UNIQUEID})'
+    ' exten => h,1,AGI(did_optimizer_hangup.agi,${UNIQUEID},${DIALSTATUS},${ANSWEREDTIME},${AMDSTATUS})' \
+    '(the last three args are optional but recommended - they let most hangups' \
+    'be scored without waiting on vicidial_log; drop ${AMDSTATUS} if you do not run AMD)'
 
 if [[ "$ROLE" == 'dialer' ]]; then
     chmod u+x "$MAINTENANCE_DIR/quick-test.sh"

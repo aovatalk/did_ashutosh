@@ -232,11 +232,18 @@ Two consequences worth knowing:
   selection degrades to ordering purely by `last_used` (plain round-robin).
   `quick-test.sh` warns (does not fail) if the hangup AGI isn't found in the
   dialplan, since this is easy to forget when adding the optimizer to a route.
-- `did_optimizer_hangup.agi` correlates a call to `vicidial_log` the same
-  exact-uniqueid-then-fallback way the admin page does. If VICIdial has not
-  yet written that call's log row by the time the `h` extension runs, that
-  one call's outcome is silently not counted (no retry) - the DID's score
-  simply reflects its other completed calls until its next one lands cleanly.
+- `did_optimizer_hangup.agi` prefers channel variables over querying
+  `vicidial_log` when the dialplan passes them: `${DIALSTATUS}` alone settles
+  every unanswered hangup (`NOANSWER`/`BUSY`/`CONGESTION`/...) with no
+  database dependency, and `${AMDSTATUS}` (if you run AMD) settles answered
+  ones too. Only an answered call with no `AMDSTATUS` still needs the
+  exact-uniqueid-then-fallback `vicidial_log` correlation the admin page also
+  uses, for VICIdial's own human/machine classification. If VICIdial hasn't
+  written that call's log row by the time the `h` extension runs, that one
+  call's outcome is silently not counted (no retry) — the DID's score simply
+  reflects its other completed calls until its next one lands cleanly. Passing
+  only `${UNIQUEID}` (no `DIALSTATUS`/`ANSWEREDTIME`/`AMDSTATUS`) falls back to
+  this `vicidial_log` path for every call.
 - Anti-repeat (avoiding immediately reusing the same DID on a campaign) is
   best-effort under heavy concurrency: it reads `last_did` without a lock, so
   two simultaneous calls can rarely both dodge a stale value rather than each
@@ -262,11 +269,13 @@ exten => _YOURPATTERN,1,AGI(call_log)
 exten => _YOURPATTERN,2,AGI(did_optimizer.agi,${campaign_id},${dialed_number},${UNIQUEID},${lead_id})
 exten => _YOURPATTERN,3,NoOp(DIDOPT server=${DIDOPT_SERVER_IP} status=${DIDOPT_STATUS} did=${DIDOPT_SELECTED} reason=${DIDOPT_REASON})
 exten => _YOURPATTERN,4,Dial(...)
-exten => h,1,AGI(did_optimizer_hangup.agi,${UNIQUEID})
+exten => h,1,AGI(did_optimizer_hangup.agi,${UNIQUEID},${DIALSTATUS},${ANSWEREDTIME},${AMDSTATUS})
 ```
 
 The `h` extension line is not optional: without it, DID performance scores
-never update (see **Call performance scoring**). Persist the lines in the
+never update (see **Call performance scoring**). The last three args are
+optional (`did_optimizer_hangup.agi,${UNIQUEID}` alone still works) but
+recommended — drop `${AMDSTATUS}` if the route doesn't run AMD. Persist the lines in the
 VICIdial carrier Dialplan Entry rather than editing a generated Asterisk
 configuration file directly. Rebuild and reload the dialplan on every
 Asterisk node in the cluster.

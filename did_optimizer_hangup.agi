@@ -4,7 +4,13 @@
 #
 # Bound to the dialplan's h (hangup) extension on every route that also runs
 # did_optimizer.agi, e.g.:
-#   exten => h,1,AGI(did_optimizer_hangup.agi,${UNIQUEID})
+#   exten => h,1,AGI(did_optimizer_hangup.agi,${UNIQUEID},${DIALSTATUS},${ANSWEREDTIME},${AMDSTATUS})
+#
+# The last three args are optional (uniqueid alone still works, falling back
+# to a vicidial_log correlation for everything) but recommended: passing
+# DIALSTATUS/ANSWEREDTIME/AMDSTATUS lets most hangups be scored straight off
+# the channel, with no dependency on vicidial_log having been written yet by
+# the time this AGI runs.
 #
 # This is the write side of the optimizer's score cache: it applies exactly
 # one completed call's outcome to that DID's running counters and recomputes
@@ -196,6 +202,16 @@ sub main {
     my $agi = read_agi_environment();
     my $uniqueid = clean_argument($ARGV[0]) || clean_argument($agi->{'uniqueid'});
     return unless $uniqueid;
+    # Optional: ${DIALSTATUS}, ${ANSWEREDTIME}, ${AMDSTATUS} from the h
+    # extension. When passed, they let most hangups be scored straight from
+    # the channel with no vicidial_log dependency at all - only an actually
+    # answered call without a usable AMDSTATUS still needs the vicidial_log
+    # correlation, to get VICIdial's own human/machine classification rather
+    # than guessing from DIALSTATUS alone (ANSWER covers human, machine, and
+    # voicemail alike).
+    my $dialstatus = uc(clean_argument($ARGV[1]));
+    my $answeredtime_arg = clean_argument($ARGV[2]);
+    my $amdstatus = uc(clean_argument($ARGV[3]));
 
     my $config = load_vicidial_config($CONFIG_FILE);
     $dbh = connect_database($config);
@@ -216,14 +232,30 @@ sub main {
     }
     $assignment->{'unique_call_id'} = $uniqueid;
 
-    my $completed = find_completed_call($dbh, $assignment);
-    unless ($completed) {
-        agi_verbose("no vicidial_log match yet for uniqueid=$uniqueid did=$assignment->{'did_number'}", 0);
-        return;
+    my ($human, $length_in_sec);
+    if ($dialstatus ne '' && $dialstatus ne 'ANSWER') {
+        # Definitively not answered (NOANSWER/BUSY/CONGESTION/...) - no
+        # vicidial_log dependency needed for the common case.
+        ($human, $length_in_sec) = (0, 0);
     }
-
-    my $human = is_human_answered($dbh, $assignment->{'campaign_id'}, $completed->{'status'} || '');
-    my $length_in_sec = ($completed->{'length_in_sec'} || 0) + 0;
+    elsif ($amdstatus ne '') {
+        # AMD already told us human vs machine directly.
+        $human = ($amdstatus eq 'HUMAN') ? 1 : 0;
+        $length_in_sec = ($answeredtime_arg =~ /^\d+$/) ? $answeredtime_arg + 0 : 0;
+    }
+    else {
+        # Either DIALSTATUS=ANSWER with no AMD result, or an older dialplan
+        # that only passes uniqueid - fall back to the vicidial_log
+        # correlation the admin page also uses.
+        my $completed = find_completed_call($dbh, $assignment);
+        unless ($completed) {
+            agi_verbose("no vicidial_log match yet for uniqueid=$uniqueid did=$assignment->{'did_number'}", 0);
+            return;
+        }
+        $human = is_human_answered($dbh, $assignment->{'campaign_id'}, $completed->{'status'} || '') ? 1 : 0;
+        $length_in_sec = ($answeredtime_arg =~ /^\d+$/)
+            ? $answeredtime_arg + 0 : (($completed->{'length_in_sec'} || 0) + 0);
+    }
     my $good = $human && $length_in_sec > $MIN_SUCCESS_DURATION;
 
     $dbh->begin_work();
