@@ -484,7 +484,7 @@ elseif ($action == 'bulk_action')
 			{$id = (int)$raw_id; if ($id > 0) {$did_ids[] = $id;}}
 		}
 	$bulk_op = isset($_POST['bulk_op']) ? $_POST['bulk_op'] : '';
-	if (!count($did_ids) || !in_array($bulk_op, array('enable','disable','delete','set_limit')))
+	if (!count($did_ids) || !in_array($bulk_op, array('enable','disable','delete','set_limit','recheck_reputation')))
 		{
 		$message = "Select at least one DID and a bulk action to apply.";
 		$message_class = 'diop-err';
@@ -492,7 +492,32 @@ elseif ($action == 'bulk_action')
 	else
 		{
 		$affected = 0;
-		if ($bulk_op == 'set_limit')
+		if ($bulk_op == 'recheck_reputation')
+			{
+			$placeholders = implode(',', array_fill(0, count($did_ids), '?'));
+			$types = str_repeat('i', count($did_ids));
+			$stmt = mysqli_prepare($link, "SELECT did_number FROM did_optimizer_pool WHERE did_id IN ($placeholders)");
+			mysqli_stmt_bind_param($stmt, $types, ...$did_ids);
+			mysqli_stmt_execute($stmt);
+			$res = mysqli_stmt_get_result($stmt);
+			$numbers = array();
+			while ($row = mysqli_fetch_assoc($res)) {$numbers[] = $row['did_number'];}
+			mysqli_stmt_close($stmt);
+
+			if (count($numbers))
+				{
+				$placeholders = implode(',', array_fill(0, count($numbers), '?'));
+				$types = str_repeat('s', count($numbers));
+				$stmt = mysqli_prepare($link, "DELETE FROM did_optimizer_reputation_cache WHERE did_number IN ($placeholders)");
+				mysqli_stmt_bind_param($stmt, $types, ...$numbers);
+				mysqli_stmt_execute($stmt);
+				mysqli_stmt_close($stmt);
+				diop_load_reputations($link, $numbers);
+				$affected = count($numbers);
+				}
+			$message = "Rechecked reputation for $affected selected DID(s).";
+			}
+		elseif ($bulk_op == 'set_limit')
 			{
 			$bulk_row_limit = max(0, (int)(isset($_POST['bulk_row_limit']) ? $_POST['bulk_row_limit'] : 0));
 			$stmt = mysqli_prepare($link, "UPDATE did_optimizer_pool SET daily_limit = ? WHERE did_id = ?");
@@ -1146,6 +1171,7 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 <span id="diop-bulk-count">0 selected</span>
 <button type="button" data-op="enable">Enable</button>
 <button type="button" data-op="disable">Disable</button>
+<button type="button" data-op="recheck_reputation">Recheck Reputation</button>
 <span class="flex items-center gap-1">
 <input type="number" id="diop-bulk-limit-input" value="0" min="0" title="Daily limit">
 <button type="button" data-op="set_limit">Set limit</button>
