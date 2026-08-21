@@ -270,6 +270,7 @@ sub get_candidate_dids {
            AND r.checked_at >= (NOW() - INTERVAL 15 MINUTE)
          WHERE p.campaign_id = ?
            AND p.enabled = 'Y'
+           AND (r.reputation IS NULL OR LOWER(r.reputation) <> 'negative')
            AND (p.daily_limit = 0 OR
                 CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END < p.daily_limit)
          ORDER BY p.did_id
