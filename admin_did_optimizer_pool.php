@@ -613,6 +613,22 @@ if ($filter_search != '')
 	{$where_parts[] = "p.did_number LIKE '%" . mysqli_real_escape_string($link, $filter_search) . "%'";}
 if ($filter_status != '')
 	{$where_parts[] = "p.enabled = '" . mysqli_real_escape_string($link, $filter_status) . "'";}
+
+if ($filter_reputation != '')
+	{
+	# The Positive/Negative/Unknown filter reads from did_optimizer_reputation_cache,
+	# which diop_load_reputations only ever populates for DIDs actually shown on a
+	# page. Without this, any DID never previously viewed has no cache row and is
+	# silently excluded from the Positive/Negative counts. Refresh (subject to the
+	# normal cache TTL, so this is a no-op once warm) every DID matching the other
+	# filters before counting so the reputation filter reflects the whole pool.
+	$precheck_where = count($where_parts) ? ('WHERE ' . implode(' AND ', $where_parts)) : '';
+	$precheck_rslt = mysqli_query($link, "SELECT did_number FROM did_optimizer_pool p $precheck_where LIMIT 5000;");
+	$precheck_numbers = array();
+	while ($prow = mysqli_fetch_assoc($precheck_rslt)) {$precheck_numbers[] = $prow['did_number'];}
+	if (count($precheck_numbers)) {diop_load_reputations($link, $precheck_numbers);}
+	}
+
 if ($filter_reputation == 'positive' || $filter_reputation == 'negative')
 	{$where_parts[] = "LOWER(COALESCE(rc.reputation,'')) = '" . $filter_reputation . "' AND COALESCE(rc.lookup_error,'') = ''";}
 elseif ($filter_reputation == 'unknown')
