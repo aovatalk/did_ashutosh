@@ -172,21 +172,21 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
         "SELECT COUNT(*) FROM information_schema.TABLES
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments','did_optimizer_campaign_state',
-              'did_optimizer_geo_prefixes','did_optimizer_geo_npa_centroids',
+              'did_optimizer_geo_prefixes',
               'did_optimizer_reputation_cache','did_optimizer_settings');" 2>/dev/null)
-    [[ "$table_count" == '7' ]] \
-        && pass 'all seven optimizer tables exist' \
-        || fail "expected 7 optimizer tables, found ${table_count:-unknown}"
+    [[ "$table_count" == '6' ]] \
+        && pass 'all six optimizer tables exist' \
+        || fail "expected 6 optimizer tables, found ${table_count:-unknown}"
 
     engine_count=$(mysql_db --batch --skip-column-names -e \
         "SELECT COUNT(*) FROM information_schema.TABLES
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments','did_optimizer_campaign_state',
-              'did_optimizer_geo_prefixes','did_optimizer_geo_npa_centroids',
+              'did_optimizer_geo_prefixes',
               'did_optimizer_reputation_cache','did_optimizer_settings')
             AND ENGINE='InnoDB'
             AND TABLE_COLLATION IN ('utf8_unicode_ci','utf8mb3_unicode_ci');" 2>/dev/null)
-    [[ "$engine_count" == '7' ]] \
+    [[ "$engine_count" == '6' ]] \
         && pass 'all optimizer tables use InnoDB and a compatible utf8 Unicode collation' \
         || {
             fail 'one or more optimizer tables has the wrong engine or collation'
@@ -197,7 +197,7 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
                   WHERE TABLE_SCHEMA='$DB_NAME'
                     AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments',
                       'did_optimizer_campaign_state','did_optimizer_geo_prefixes',
-                      'did_optimizer_geo_npa_centroids','did_optimizer_reputation_cache',
+                      'did_optimizer_reputation_cache',
                       'did_optimizer_settings')
                   ORDER BY TABLE_NAME;" 2>/dev/null || true)
             while IFS= read -r storage_line; do
@@ -222,13 +222,12 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
               OR (TABLE_NAME='did_optimizer_geo_prefixes' AND INDEX_NAME IN
                     ('PRIMARY','uq_didopt_geo_exchange_postal','idx_didopt_geo_npanxx',
                      'idx_didopt_geo_npa','idx_didopt_geo_city_state','idx_didopt_geo_state'))
-              OR (TABLE_NAME='did_optimizer_geo_npa_centroids' AND INDEX_NAME='PRIMARY')
               OR (TABLE_NAME='did_optimizer_reputation_cache' AND INDEX_NAME IN
                     ('PRIMARY','idx_didopt_reputation_freshness','idx_didopt_reputation_checked'))
               OR (TABLE_NAME='did_optimizer_settings' AND INDEX_NAME='PRIMARY'));" 2>/dev/null)
-    [[ "$index_count" == '21' ]] \
+    [[ "$index_count" == '20' ]] \
         && pass 'all required optimizer indexes exist' \
-        || fail "expected 21 required indexes, found ${index_count:-unknown}"
+        || fail "expected 20 required indexes, found ${index_count:-unknown}"
 
     reputation_column_count=$(mysql_db --batch --skip-column-names -e \
         "SELECT COUNT(*) FROM information_schema.COLUMNS
@@ -242,8 +241,7 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
         "SELECT CONCAT('pool=', (SELECT COUNT(*) FROM did_optimizer_pool),
                        ' assignments=', (SELECT COUNT(*) FROM did_optimizer_assignments),
                        ' campaign_state=', (SELECT COUNT(*) FROM did_optimizer_campaign_state),
-                       ' geo_prefixes=', (SELECT COUNT(*) FROM did_optimizer_geo_prefixes),
-                       ' geo_centroids=', (SELECT COUNT(*) FROM did_optimizer_geo_npa_centroids));" 2>/dev/null || true)
+                       ' geo_prefixes=', (SELECT COUNT(*) FROM did_optimizer_geo_prefixes));" 2>/dev/null || true)
     [[ -n "$row_summary" ]] && pass "table queries succeed ($row_summary)" \
         || fail 'could not query optimizer table row counts'
     geo_prefix_count=$(mysql_db --batch --skip-column-names -e \
@@ -251,11 +249,6 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
     [[ "$geo_prefix_count" =~ ^[0-9]+$ && "$geo_prefix_count" -gt 0 ]] \
         && pass "NPA-NXX geographic dataset is populated ($geo_prefix_count rows)" \
         || fail 'NPA-NXX geographic dataset is empty'
-    centroid_count=$(mysql_db --batch --skip-column-names -e \
-        'SELECT COUNT(*) FROM did_optimizer_geo_npa_centroids;' 2>/dev/null || true)
-    [[ "$centroid_count" =~ ^[0-9]+$ && "$centroid_count" -gt 0 ]] \
-        && pass "NPA centroid cache is populated ($centroid_count rows)" \
-        || fail 'NPA centroid cache is empty'
 else
     fail "MySQL connection to $DB_NAME"
 fi

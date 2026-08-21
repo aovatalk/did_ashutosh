@@ -80,15 +80,13 @@ sudo ./install_did_optimizer.sh --role database
 Expected result:
 
 ```text
-Shared database schema ready (7 tables).
+Shared database schema ready (6 tables).
 ```
 
 The database role connects through the local MySQL socket. It does not require
 or discover a database IP address and does not store database credentials. It
 also downloads and imports `NPA_dataset.zip` into `did_optimizer_geo_prefixes`
-for NPA-NXX, city, state, and area-code matching, then rebuilds
-`did_optimizer_geo_npa_centroids` after the import so live calls can rank
-nearby area codes without aggregating the large postal-level table.
+for NPA-NXX, city, state, and area-code matching.
 
 Pass `--clean` to drop and recreate the optimizer tables (see **Data safety**
 below).
@@ -189,7 +187,7 @@ sudo /usr/local/share/did-optimizer/quick-test.sh
 
 Run the test on every dialer/web node. It reads the shared database connection
 and local server identity from `/etc/astguiclient.conf`, then validates the Perl
-AGI and PHP deployments, all seven tables and indexes, geo/centroid population,
+AGI and PHP deployments, all six tables and indexes, geo prefix population,
 and active plus persistent dialplan integration.
 
 The database node does not need the dialer health test. Its schema is verified

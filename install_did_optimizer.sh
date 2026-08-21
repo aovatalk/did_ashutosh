@@ -108,20 +108,12 @@ install_database() {
             "DROP TABLE IF EXISTS did_optimizer_assignments;
              DROP TABLE IF EXISTS did_optimizer_campaign_state;
              DROP TABLE IF EXISTS did_optimizer_pool;
-             DROP TABLE IF EXISTS did_optimizer_geo_npa_centroids;
              DROP TABLE IF EXISTS did_optimizer_geo_prefixes;
              DROP TABLE IF EXISTS did_optimizer_reputation_cache;
              DROP TABLE IF EXISTS did_optimizer_settings;"
     fi
     printf 'Applying optimizer schema to shared database %s...\n' "$DB_NAME"
     mysql --protocol=socket --database="$DB_NAME" < "$SQL_SOURCE"
-    mysql --protocol=socket --database="$DB_NAME" -e \
-        "CREATE TABLE IF NOT EXISTS did_optimizer_geo_npa_centroids (
-             npa CHAR(3) NOT NULL,
-             latitude DECIMAL(10,6) NOT NULL,
-             longitude DECIMAL(10,6) NOT NULL,
-             PRIMARY KEY (npa)
-         ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;"
 
     # Replace the narrow placeholder table from early cluster releases. This
     # table contains only derived public data, so rebuilding it does not remove
@@ -163,25 +155,11 @@ install_database() {
         die 'NPA-NXX geographic dataset import failed.'
     fi
     rm -f -- "$geo_csv"
-    printf '%s\n' 'Refreshing precomputed NPA geographic centroids...'
-    mysql --protocol=socket --database="$DB_NAME" -e \
-        "TRUNCATE TABLE did_optimizer_geo_npa_centroids;
-         INSERT INTO did_optimizer_geo_npa_centroids (npa, latitude, longitude)
-         SELECT npa, AVG(latitude), AVG(longitude)
-           FROM did_optimizer_geo_prefixes
-          WHERE latitude IS NOT NULL
-            AND longitude IS NOT NULL
-          GROUP BY npa;"
     geo_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
         'SELECT COUNT(*) FROM did_optimizer_geo_prefixes;')
     [[ "$geo_count" =~ ^[0-9]+$ && "$geo_count" -gt 0 ]] \
         || die 'NPA-NXX geographic dataset import produced no rows.'
     printf 'Geographic prefix dataset ready (%s rows).\n' "$geo_count"
-    centroid_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
-        'SELECT COUNT(*) FROM did_optimizer_geo_npa_centroids;')
-    [[ "$centroid_count" =~ ^[0-9]+$ && "$centroid_count" -gt 0 ]] \
-        || die 'NPA centroid refresh produced no rows.'
-    printf 'NPA centroid cache ready (%s rows).\n' "$centroid_count"
 
     # Upgrade installations made by the original three-table release.
     column_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
@@ -231,10 +209,9 @@ install_database() {
           WHERE TABLE_SCHEMA='$DB_NAME'
             AND TABLE_NAME IN ('did_optimizer_pool','did_optimizer_assignments',
               'did_optimizer_campaign_state','did_optimizer_geo_prefixes',
-              'did_optimizer_geo_npa_centroids','did_optimizer_reputation_cache',
-              'did_optimizer_settings');")
-    [[ "$table_count" == '7' ]] \
-        || die "Schema verification failed: expected 7 optimizer tables, found $table_count"
+              'did_optimizer_reputation_cache','did_optimizer_settings');")
+    [[ "$table_count" == '6' ]] \
+        || die "Schema verification failed: expected 6 optimizer tables, found $table_count"
     printf 'Shared database schema ready (%s tables).\n' "$table_count"
 }
 
