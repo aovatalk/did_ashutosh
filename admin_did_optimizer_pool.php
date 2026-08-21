@@ -539,6 +539,30 @@ elseif ($action == 'bulk_limit')
 		$message = "Set daily limit to $bulk_limit for $affected DID(s) in campaign $bulk_campaign.";
 		}
 	}
+elseif ($action == 'recheck_reputation')
+	{
+	$did_number = diop_clean_digits($_POST['did_number'], 32);
+	if ($did_number == '')
+		{
+		$message = "DID number is required to recheck reputation.";
+		$message_class = 'diop-err';
+		}
+	else
+		{
+		$stmt = mysqli_prepare($link, "DELETE FROM did_optimizer_reputation_cache WHERE did_number = ?");
+		mysqli_stmt_bind_param($stmt, 's', $did_number);
+		mysqli_stmt_execute($stmt);
+		mysqli_stmt_close($stmt);
+		$fresh = diop_load_reputations($link, array($did_number));
+		$row = isset($fresh[$did_number]) ? $fresh[$did_number] : null;
+		if ($row && !empty($row['reputation']))
+			{$message = "Reputation for $did_number: " . $row['reputation'] . ".";}
+		elseif ($row && !empty($row['lookup_error']))
+			{$message = "Reputation recheck for $did_number failed: " . $row['lookup_error']; $message_class = 'diop-err';}
+		else
+			{$message = "Reputation recheck requested for $did_number; no result returned."; $message_class = 'diop-err';}
+		}
+	}
 
 $filter_campaign = isset($_GET['campaign_id']) ? diop_clean_campaign_id($_GET['campaign_id']) : '';
 $filter_search   = isset($_GET['q']) ? diop_clean_digits($_GET['q'], 32) : '';
@@ -1303,6 +1327,11 @@ if ($page < $total_pages) {
 <button type="submit" class="w-full bg-gray-600 hover:bg-gray-700 text-white text-sm font-medium rounded-md py-2">
 <?php echo ($r['enabled']=='Y') ? 'Disable this DID' : 'Enable this DID'; ?>
 </button>
+</form>
+<form method="post" action="<?php echo htmlspecialchars($PHP_SELF); ?>" class="mt-3">
+<input type="hidden" name="action" value="recheck_reputation">
+<input type="hidden" name="did_number" value="<?php echo htmlspecialchars($r['did_number']); ?>">
+<button type="submit" class="w-full bg-gray-600 hover:bg-gray-700 text-white text-sm font-medium rounded-md py-2">Recheck Reputation</button>
 </form>
 </div>
 </div>
