@@ -267,3 +267,8 @@ printf '%s\n' \
     'Add after call_log and immediately before Dial() on every dialer node:' \
     ' same => n,AGI(did_optimizer.agi,${campaign_id},${dialed_number},${UNIQUEID},${lead_id})' \
     ' same => n,NoOp(DID optimizer: ${DIDOPT_STATUS} ${DIDOPT_SELECTED} ${DIDOPT_REASON})'
+
+if [[ "$ROLE" == 'dialer' ]]; then
+    chmod u+x "$MAINTENANCE_DIR/quick-test.sh"
+    "$MAINTENANCE_DIR/quick-test.sh"
+fi
