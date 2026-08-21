@@ -103,10 +103,15 @@ sudo ./install_did_optimizer.sh --role dialer
 The dialer role installs:
 
 - `/var/lib/asterisk/agi-bin/did_optimizer.agi` (owner `asterisk:asterisk`, mode `0750`);
-- `admin_did_optimizer_pool.php` in the detected VICIdial web directory
-  (`/srv/www/htdocs/vicidial`, `/var/www/html/vicidial`, or `/var/www/vicidial`); and
-- `/usr/local/share/did-optimizer/`, holding maintenance copies of the AGI, the
-  PHP admin page, and `quick-test.sh`.
+- `admin_did_optimizer_pool.php` and `did_optimizer_reputation.inc.php` in the
+  detected VICIdial web directory (`/srv/www/htdocs/vicidial`,
+  `/var/www/html/vicidial`, or `/var/www/vicidial`);
+- `reputation_cron.php` in the same VICIdial web directory, plus
+  `/etc/cron.d/did-optimizer-reputation` running it every 5 minutes - unless
+  `--reputation no` is passed (see **Reputation configuration** below); and
+- `/usr/local/share/did-optimizer/`, holding maintenance copies of the AGI,
+  the PHP admin page and its reputation include, `reputation_cron.php`
+  (unless skipped), and `quick-test.sh`.
 
 No server address or database credential is passed to the installer. Dialer
 nodes read `VARserver_ip` and all `VARDB_*` settings from their existing
