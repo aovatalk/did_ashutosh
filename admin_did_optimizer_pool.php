@@ -318,6 +318,32 @@ function diop_calculate_performance_scores($link, $visible_rows)
 	return $scores;
 	}
 
+# Rebuilds the same pool WHERE clause as the list view's own filters, from a
+# raw $_GET-shaped array. Used by the bulk "apply to everything matching this
+# filter" scope, which acts on filter query-string params rather than a
+# posted list of checked ids.
+function diop_pool_filter_where($link, $get)
+	{
+	$campaign   = isset($get['campaign_id']) ? diop_clean_campaign_id($get['campaign_id']) : '';
+	$search     = isset($get['q']) ? diop_clean_digits($get['q'], 32) : '';
+	$status     = isset($get['status']) && in_array($get['status'], array('Y','N')) ? $get['status'] : '';
+	$reputation = isset($get['reputation']) && in_array($get['reputation'], array('positive','negative','unknown')) ? $get['reputation'] : '';
+	$local_key  = isset($get['local_key']) ? diop_clean_digits($get['local_key'], 16) : '';
+	$at_limit   = isset($get['at_limit']) && $get['at_limit'] == '1';
+
+	$parts = array();
+	if ($campaign != '') {$parts[] = "p.campaign_id = '" . mysqli_real_escape_string($link, $campaign) . "'";}
+	if ($search != '') {$parts[] = "p.did_number LIKE '%" . mysqli_real_escape_string($link, $search) . "%'";}
+	if ($status != '') {$parts[] = "p.enabled = '" . mysqli_real_escape_string($link, $status) . "'";}
+	if ($reputation == 'positive' || $reputation == 'negative')
+		{$parts[] = "LOWER(COALESCE(rc.reputation,'')) = '" . $reputation . "' AND COALESCE(rc.lookup_error,'') = ''";}
+	elseif ($reputation == 'unknown')
+		{$parts[] = "(rc.did_number IS NULL OR COALESCE(rc.lookup_error,'') <> '' OR LOWER(COALESCE(rc.reputation,'')) NOT IN ('positive','negative'))";}
+	if ($local_key != '') {$parts[] = "p.local_key = '" . mysqli_real_escape_string($link, $local_key) . "'";}
+	if ($at_limit) {$parts[] = "p.daily_limit > 0 AND (CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END) >= p.daily_limit";}
+	return count($parts) ? ('WHERE ' . implode(' AND ', $parts)) : '';
+	}
+
 $action = isset($_POST['action']) ? $_POST['action'] : '';
 $message = '';
 $message_class = 'diop-ok';
@@ -475,12 +501,24 @@ elseif ($action == 'sync')
 	}
 elseif ($action == 'bulk_action')
 	{
-	# ponytail: one prepared statement executed per id (N+1), capped at 1000 rows -
+	# ponytail: one prepared statement executed per id (N+1), capped at 5000 rows -
 	# switch to a single UPDATE/DELETE ... WHERE did_id IN (...) if this list ever needs to be huge.
 	$did_ids = array();
-	if (isset($_POST['did_ids']) && is_array($_POST['did_ids']))
+	if (isset($_POST['bulk_scope']) && $_POST['bulk_scope'] == 'filtered')
 		{
-		foreach (array_slice($_POST['did_ids'], 0, 1000) as $raw_id)
+		# "Select all N matching this filter" - act on every DID matching the
+		# current list filters (read from the query string), not just the ids
+		# checked on the current page.
+		$bf_where = diop_pool_filter_where($link, $_GET);
+		$rslt = mysqli_query($link,
+			"SELECT p.did_id FROM did_optimizer_pool p
+			 LEFT JOIN did_optimizer_reputation_cache rc ON rc.did_number = p.did_number
+			 $bf_where LIMIT 5000;");
+		while ($row = mysqli_fetch_assoc($rslt)) {$did_ids[] = (int)$row['did_id'];}
+		}
+	elseif (isset($_POST['did_ids']) && is_array($_POST['did_ids']))
+		{
+		foreach (array_slice($_POST['did_ids'], 0, 5000) as $raw_id)
 			{$id = (int)$raw_id; if ($id > 0) {$did_ids[] = $id;}}
 		}
 	$bulk_op = isset($_POST['bulk_op']) ? $_POST['bulk_op'] : '';
@@ -1178,13 +1216,17 @@ Status: <?php echo $reputation_config ? 'configured' : 'not configured (neutral 
 </form>
 </div></div>
 
-<form method="post" action="<?php echo htmlspecialchars($PHP_SELF); ?>" id="diop-bulk-form">
+<form method="post" action="<?php echo htmlspecialchars($PHP_SELF) . ($qs_base != '' ? '?' . $qs_base : ''); ?>" id="diop-bulk-form">
 <input type="hidden" name="action" value="bulk_action">
 <input type="hidden" name="bulk_op" id="diop-bulk-op" value="">
+<input type="hidden" name="bulk_scope" id="diop-bulk-scope" value="selected">
 <div id="diop-bulk-ids"></div>
 </form>
 <div id="diop-bulkbar" class="diop-bulkbar">
 <span id="diop-bulk-count">0 selected</span>
+<?php if ($total_filtered > $per_page) { ?>
+<span id="diop-bulk-select-all-filtered" class="hidden text-blue-700 underline cursor-pointer">Select all <?php echo $total_filtered; ?> matching this filter</span>
+<?php } ?>
 <button type="button" data-op="enable">Enable</button>
 <button type="button" data-op="disable">Disable</button>
 <button type="button" data-op="recheck_reputation">Recheck Reputation</button>
@@ -1461,34 +1503,51 @@ function diopInitBulkBar() {
 	var countEl = document.getElementById('diop-bulk-count');
 	var selectAll = document.getElementById('diop-select-all');
 	var rowChecks = document.querySelectorAll('.diop-row-check');
+	var allHint = document.getElementById('diop-bulk-select-all-filtered');
+	var scopeInput = document.getElementById('diop-bulk-scope');
+	var totalFiltered = <?php echo (int)$total_filtered; ?>;
+	var scopeFiltered = false;
 	if (!bar || !rowChecks.length) { return; }
 	function checked() { return Array.prototype.filter.call(rowChecks, function (c) { return c.checked; }); }
 	function refresh() {
 		var n = checked().length;
+		if (n !== rowChecks.length) { scopeFiltered = false; }
 		bar.classList.toggle('is-active', n > 0);
-		countEl.textContent = n + ' selected';
+		countEl.textContent = scopeFiltered ? ('All ' + totalFiltered + ' matching this filter selected') : (n + ' selected');
 		if (selectAll) { selectAll.checked = n === rowChecks.length; }
+		if (allHint) { allHint.classList.toggle('hidden', scopeFiltered || n === 0 || n !== rowChecks.length); }
+		if (scopeInput) { scopeInput.value = scopeFiltered ? 'filtered' : 'selected'; }
 	}
 	Array.prototype.forEach.call(rowChecks, function (c) { c.addEventListener('change', refresh); });
 	if (selectAll) {
 		selectAll.addEventListener('change', function () {
+			scopeFiltered = false;
 			Array.prototype.forEach.call(rowChecks, function (c) { c.checked = selectAll.checked; });
+			refresh();
+		});
+	}
+	if (allHint) {
+		allHint.addEventListener('click', function () {
+			scopeFiltered = true;
 			refresh();
 		});
 	}
 	bar.querySelectorAll('button[data-op]').forEach(function (btn) {
 		btn.addEventListener('click', function () {
 			var ids = checked().map(function (c) { return c.getAttribute('data-did-id'); });
-			if (!ids.length) { return; }
+			var count = scopeFiltered ? totalFiltered : ids.length;
+			if (!count) { return; }
 			var op = btn.getAttribute('data-op');
-			if (op === 'delete' && !confirm('Delete ' + ids.length + ' selected DID(s) from the pool?')) { return; }
+			if (op === 'delete' && !confirm('Delete ' + count + ' selected DID(s) from the pool?')) { return; }
 			var idsWrap = document.getElementById('diop-bulk-ids');
 			idsWrap.innerHTML = '';
-			ids.forEach(function (id) {
-				var input = document.createElement('input');
-				input.type = 'hidden'; input.name = 'did_ids[]'; input.value = id;
-				idsWrap.appendChild(input);
-			});
+			if (!scopeFiltered) {
+				ids.forEach(function (id) {
+					var input = document.createElement('input');
+					input.type = 'hidden'; input.name = 'did_ids[]'; input.value = id;
+					idsWrap.appendChild(input);
+				});
+			}
 			document.getElementById('diop-bulk-op').value = op;
 			if (op === 'set_limit') {
 				var limitInput = document.createElement('input');
