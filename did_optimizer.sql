@@ -1,6 +1,11 @@
 -- DID Optimizer custom schema for VICIdial.
 -- These tables must use InnoDB: the AGI relies on transactions and row locks.
 
+-- sample_size/human_answered_calls/good_calls/answered_seconds_sum and
+-- performance_score are maintained incrementally by did_optimizer_hangup.agi
+-- (bound to the dialplan's h extension) as each call completes, so
+-- did_optimizer.agi never recomputes a score in the selection request path -
+-- it only reads performance_score and reserves a row.
 CREATE TABLE IF NOT EXISTS did_optimizer_pool (
     did_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     did_number VARCHAR(32) NOT NULL,
@@ -14,6 +19,11 @@ CREATE TABLE IF NOT EXISTS did_optimizer_pool (
     usage_date DATE DEFAULT NULL,
     daily_limit INT UNSIGNED NOT NULL DEFAULT 0,
     last_used DATETIME DEFAULT NULL,
+    sample_size INT UNSIGNED NOT NULL DEFAULT 0,
+    human_answered_calls INT UNSIGNED NOT NULL DEFAULT 0,
+    good_calls INT UNSIGNED NOT NULL DEFAULT 0,
+    answered_seconds_sum BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    performance_score DECIMAL(8,6) NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (did_id),
     UNIQUE KEY uq_didopt_pool_campaign_did (campaign_id, did_number),
@@ -22,6 +32,9 @@ CREATE TABLE IF NOT EXISTS did_optimizer_pool (
     KEY idx_didopt_pool_lru (campaign_id, last_used)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
 
+-- stats_applied guards did_optimizer_hangup.agi against double-counting a
+-- call: it flips Y only once, inside the same transaction that applies that
+-- call's delta to did_optimizer_pool/did_optimizer_campaign_state.
 CREATE TABLE IF NOT EXISTS did_optimizer_assignments (
     assignment_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     unique_call_id VARCHAR(64) NOT NULL,
@@ -34,6 +47,7 @@ CREATE TABLE IF NOT EXISTS did_optimizer_assignments (
     local_key VARCHAR(16) NOT NULL DEFAULT '',
     selection_reason VARCHAR(64) NOT NULL,
     callerid_applied ENUM('Y','N') NOT NULL DEFAULT 'N',
+    stats_applied ENUM('Y','N') NOT NULL DEFAULT 'N',
     assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (assignment_id),
     UNIQUE KEY uq_didopt_assignment_call (unique_call_id),
@@ -45,11 +59,16 @@ CREATE TABLE IF NOT EXISTS did_optimizer_assignments (
     KEY idx_didopt_assignment_server (server_ip, assigned_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
 
--- One row per campaign is the narrow concurrency lock. Calls in unrelated
--- campaigns lock different rows and therefore do not block one another.
+-- One row per campaign. prior_* are the campaign-wide running totals used as
+-- the Bayesian smoothing prior (updated alongside each DID's own counters in
+-- did_optimizer_hangup.agi, in the same transaction).
 CREATE TABLE IF NOT EXISTS did_optimizer_campaign_state (
     campaign_id VARCHAR(20) NOT NULL,
     last_did VARCHAR(32) DEFAULT NULL,
+    prior_sample INT UNSIGNED NOT NULL DEFAULT 0,
+    prior_human INT UNSIGNED NOT NULL DEFAULT 0,
+    prior_good INT UNSIGNED NOT NULL DEFAULT 0,
+    prior_seconds_sum BIGINT UNSIGNED NOT NULL DEFAULT 0,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (campaign_id)

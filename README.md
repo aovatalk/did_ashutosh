@@ -1,22 +1,30 @@
 # Cluster DID Optimizer for VICIdial
 
 DID Optimizer selects an outbound caller ID from a campaign-owned DID pool using
-local area-code matching, availability limits, Bayesian-smoothed call performance,
-and least-recently-used balancing among similarly performing numbers.
+local area-code matching, availability limits, and a Bayesian-smoothed call
+performance score, ranking by score then least-recently-used.
 
 ## Architecture
 
 This build supports one shared database and any number of Asterisk/web nodes.
-Each dialer runs the optimizer as a one-shot Asterisk AGI script (`did_optimizer.agi`),
-invoked directly from the dialplan per call. There is no standalone daemon or
-FastAGI service to manage — the script connects, selects a DID, applies the
-caller ID, and disconnects within the same AGI invocation.
+Each dialer runs the optimizer as two one-shot Asterisk AGI scripts invoked
+directly from the dialplan, no standalone daemon or FastAGI service to manage:
 
-Selection counters, assignment history, and the per-campaign concurrency lock
-live in the shared database. Live-call discovery, idempotency, and performance
-correlation are scoped by the originating VICIdial `VARserver_ip`, keeping
-identical Asterisk unique IDs from different dialers from crossing node
-boundaries during selection.
+- `did_optimizer.agi` runs before `Dial()` and selects/reserves a DID. It never
+  computes a score or aggregates call history - it only reads each candidate's
+  already-current `performance_score` off `did_optimizer_pool` and reserves the
+  best-ranked eligible row with `FOR UPDATE SKIP LOCKED`, so concurrent calls
+  each grab a different row instead of queueing behind a shared lock.
+- `did_optimizer_hangup.agi` runs on the dialplan's `h` (hangup) extension and
+  is the only thing that updates a DID's counters and `performance_score`,
+  incrementally, once per completed call. See **Call performance scoring**
+  below.
+
+Selection counters, assignment history, and per-DID/per-campaign running call
+stats live in the shared database. Live-call discovery, idempotency, and
+performance correlation are scoped by the originating VICIdial `VARserver_ip`,
+keeping identical Asterisk unique IDs from different dialers from crossing
+node boundaries during selection.
 
 The package contains no server addresses or database credentials. Each dialer
 uses its existing VICIdial configuration (`/etc/astguiclient.conf`), while
@@ -102,16 +110,22 @@ sudo ./install_did_optimizer.sh --role dialer
 
 The dialer role installs:
 
-- `/var/lib/asterisk/agi-bin/did_optimizer.agi` (owner `asterisk:asterisk`, mode `0750`);
+- `/var/lib/asterisk/agi-bin/did_optimizer.agi` and
+  `/var/lib/asterisk/agi-bin/did_optimizer_hangup.agi` (owner `asterisk:asterisk`,
+  mode `0750`);
 - `admin_did_optimizer_pool.php` and `did_optimizer_reputation.inc.php` in the
   detected VICIdial web directory (`/srv/www/htdocs/vicidial`,
   `/var/www/html/vicidial`, or `/var/www/vicidial`);
 - `reputation_cron.php` in the same VICIdial web directory, plus
   `/etc/cron.d/did-optimizer-reputation` running it every 5 minutes - unless
   `--reputation no` is passed (see **Reputation configuration** below); and
-- `/usr/local/share/did-optimizer/`, holding maintenance copies of the AGI,
-  the PHP admin page and its reputation include, `reputation_cron.php`
+- `/usr/local/share/did-optimizer/`, holding maintenance copies of both AGI
+  scripts, the PHP admin page and its reputation include, `reputation_cron.php`
   (unless skipped), and `quick-test.sh`.
+
+The installer prints the dialplan lines to add for both AGI scripts (see
+**Call performance scoring** below for why `did_optimizer_hangup.agi` on the
+`h` extension is required, not optional).
 
 No server address or database credential is passed to the installer. Dialer
 nodes read `VARserver_ip` and all `VARDB_*` settings from their existing
@@ -128,7 +142,10 @@ login with `user_level > 7`) provides:
 - campaign-wide and per-DID daily limits, with enable/disable and bulk actions;
 - reputation filtering and cached provider results;
 - Bayesian DID performance scores weighted by good-call rate (40%), human-answer
-  rate (24%), average answered duration (16%), and reputation (20%);
+  rate (24%), average answered duration (16%), and reputation (20%) - computed
+  live from `vicidial_log` for display here, independently of the AGI's own
+  precomputed `performance_score` used for selection (see **Call performance
+  scoring**);
 - per-DID call history (most recent 100 assignments); and
 - browser-persisted automatic refresh intervals with dismissible toast
   notifications for every action.
@@ -183,6 +200,51 @@ and admin UI (including manual/bulk recheck) still work either way; only the
 automatic background sweep is skipped, so any DID not opened in the admin
 page stays `Unknown`.
 
+### Call performance scoring
+
+Scores are precomputed and updated incrementally, never recomputed in the
+selection request path:
+
+- `did_optimizer_pool` carries each DID's running counters (`sample_size`,
+  `human_answered_calls`, `good_calls`, `answered_seconds_sum`) and its
+  current `performance_score`.
+- `did_optimizer_hangup.agi`, bound to the dialplan's `h` extension, is the
+  only thing that changes them. When a call completes it applies that one
+  call's outcome as a `+1`-style delta to its DID's counters (and to the
+  campaign-wide running totals in `did_optimizer_campaign_state`, which serve
+  as the Bayesian smoothing prior), then recomputes and stores just that DID's
+  `performance_score`. This is a deliberate simplification versus computing
+  the prior fresh per call from whichever candidate subset happened to be
+  compared: the prior is now a stable, cheap-to-maintain campaign-wide running
+  total instead of a per-call aggregate query.
+- `did_optimizer.agi` (the selection side) only ever reads `performance_score`
+  off `did_optimizer_pool` — it does no scoring math and touches `vicidial_log`
+  never. Candidates are reserved with `SELECT ... ORDER BY performance_score
+  DESC, last_used ASC LIMIT 1 FOR UPDATE SKIP LOCKED`: concurrent calls each
+  grab a different eligible row instead of queueing behind a shared lock, and
+  a row someone else is mid-reservation on is simply skipped rather than
+  blocked on.
+
+Two consequences worth knowing:
+
+- **Without `did_optimizer_hangup.agi` wired into the `h` extension, scores
+  never update.** Every DID keeps `performance_score = 0` forever and
+  selection degrades to ordering purely by `last_used` (plain round-robin).
+  `quick-test.sh` warns (does not fail) if the hangup AGI isn't found in the
+  dialplan, since this is easy to forget when adding the optimizer to a route.
+- `did_optimizer_hangup.agi` correlates a call to `vicidial_log` the same
+  exact-uniqueid-then-fallback way the admin page does. If VICIdial has not
+  yet written that call's log row by the time the `h` extension runs, that
+  one call's outcome is silently not counted (no retry) - the DID's score
+  simply reflects its other completed calls until its next one lands cleanly.
+- Anti-repeat (avoiding immediately reusing the same DID on a campaign) is
+  best-effort under heavy concurrency: it reads `last_did` without a lock, so
+  two simultaneous calls can rarely both dodge a stale value rather than each
+  other's pick. Traded deliberately for not serializing every call behind one
+  row lock.
+
+`FOR UPDATE ... SKIP LOCKED` requires MySQL 8.0+ or MariaDB 10.6+.
+
 ### Data safety
 
 Normal installation creates missing tables and upgrades the original schema
@@ -192,18 +254,22 @@ assignment history, and campaign state — before recreating them.
 
 ## Dialplan
 
-Add the optimizer after VICIdial's `call_log` AGI and before the carrier `Dial()`:
+Add the optimizer after VICIdial's `call_log` AGI and before the carrier `Dial()`,
+and add `did_optimizer_hangup.agi` on the same route's `h` extension:
 
 ```asterisk
 exten => _YOURPATTERN,1,AGI(call_log)
 exten => _YOURPATTERN,2,AGI(did_optimizer.agi,${campaign_id},${dialed_number},${UNIQUEID},${lead_id})
 exten => _YOURPATTERN,3,NoOp(DIDOPT server=${DIDOPT_SERVER_IP} status=${DIDOPT_STATUS} did=${DIDOPT_SELECTED} reason=${DIDOPT_REASON})
 exten => _YOURPATTERN,4,Dial(...)
+exten => h,1,AGI(did_optimizer_hangup.agi,${UNIQUEID})
 ```
 
-Persist the lines in the VICIdial carrier Dialplan Entry rather than editing a
-generated Asterisk configuration file directly. Rebuild and reload the
-dialplan on every Asterisk node in the cluster.
+The `h` extension line is not optional: without it, DID performance scores
+never update (see **Call performance scoring**). Persist the lines in the
+VICIdial carrier Dialplan Entry rather than editing a generated Asterisk
+configuration file directly. Rebuild and reload the dialplan on every
+Asterisk node in the cluster.
 
 ## Verify
 
@@ -212,9 +278,11 @@ sudo /usr/local/share/did-optimizer/quick-test.sh
 ```
 
 Run the test on every dialer/web node. It reads the shared database connection
-and local server identity from `/etc/astguiclient.conf`, then validates the Perl
-AGI and PHP deployments, all six tables and indexes, geo prefix population,
-and active plus persistent dialplan integration.
+and local server identity from `/etc/astguiclient.conf`, then validates both
+Perl AGI deployments and the PHP deployment, all six tables and indexes, geo
+prefix population, the reputation sweep cron, and active plus persistent
+dialplan integration for both the selection AGI and the hangup AGI (the
+latter only warns, since it's easy to forget when wiring up a new route).
 
 The database node does not need the dialer health test. Its schema is verified
 during `sudo ./install_did_optimizer.sh --role database`.
@@ -225,12 +293,13 @@ during `sudo ./install_did_optimizer.sh --role database`.
 sudo ./uninstall.sh --role dialer
 ```
 
-Removes the deployed AGI, the admin PHP page (and its reputation include and
-cron sweep) from every supported VICIdial web root, the
+Removes both deployed AGI scripts, the admin PHP page (and its reputation
+include and cron sweep) from every supported VICIdial web root, the
 `/etc/cron.d/did-optimizer-reputation` cron entry, and the
 `/usr/local/share/did-optimizer/` maintenance copies. The shared database
-schema and dialplan are left unchanged; remove the optimizer line from the
-VICIdial carrier Dialplan Entry and rebuild/reload the dialplan separately.
+schema and dialplan are left unchanged; remove the optimizer AGI/NoOp/h-extension
+lines from the VICIdial carrier Dialplan Entry and rebuild/reload the dialplan
+separately.
 
 ```bash
 sudo ./uninstall.sh --role database --purge-data

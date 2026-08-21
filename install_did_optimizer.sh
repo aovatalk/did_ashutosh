@@ -6,12 +6,14 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 SQL_SOURCE="$SCRIPT_DIR/did_optimizer.sql"
 AGI_SOURCE="$SCRIPT_DIR/did_optimizer.agi"
+HANGUP_AGI_SOURCE="$SCRIPT_DIR/did_optimizer_hangup.agi"
 PHP_SOURCE="$SCRIPT_DIR/admin_did_optimizer_pool.php"
 REPUTATION_INC_SOURCE="$SCRIPT_DIR/did_optimizer_reputation.inc.php"
 REPUTATION_CRON_SOURCE="$SCRIPT_DIR/reputation_cron.php"
 QUICK_TEST_SOURCE="$SCRIPT_DIR/quick-test.sh"
 DB_NAME="asterisk"
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
+HANGUP_AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer_hangup.agi"
 MAINTENANCE_DIR="/usr/local/share/did-optimizer"
 REPUTATION_CRON_FILE="/etc/cron.d/did-optimizer-reputation"
 ROLE=""
@@ -108,6 +110,7 @@ if [[ "$ROLE" == 'database' ]]; then
     download_url_file NPA_dataset.zip "$GEO_DATASET_URL"
 else
     download_source_file did_optimizer.agi
+    download_source_file did_optimizer_hangup.agi
     download_source_file admin_did_optimizer_pool.php
     download_source_file did_optimizer_reputation.inc.php
     if ((REPUTATION_CRON_ENABLED)); then
@@ -203,6 +206,55 @@ install_database() {
                ADD KEY idx_didopt_assignment_server (server_ip, assigned_at);"
     fi
 
+    # Add the incremental scoring columns for installations made before the
+    # did_optimizer_hangup.agi / SKIP LOCKED selection redesign.
+    for pool_column_def in \
+        'sample_size:INT UNSIGNED NOT NULL DEFAULT 0' \
+        'human_answered_calls:INT UNSIGNED NOT NULL DEFAULT 0' \
+        'good_calls:INT UNSIGNED NOT NULL DEFAULT 0' \
+        'answered_seconds_sum:BIGINT UNSIGNED NOT NULL DEFAULT 0' \
+        'performance_score:DECIMAL(8,6) NOT NULL DEFAULT 0'
+    do
+        pool_column_name="${pool_column_def%%:*}"
+        pool_column_type="${pool_column_def#*:}"
+        pool_column_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
+            "SELECT COUNT(*) FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_NAME='did_optimizer_pool'
+                AND COLUMN_NAME='$pool_column_name';")
+        if [[ "$pool_column_count" == '0' ]]; then
+            mysql --protocol=socket --database="$DB_NAME" -e \
+                "ALTER TABLE did_optimizer_pool ADD COLUMN $pool_column_name $pool_column_type;"
+        fi
+    done
+
+    stats_applied_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
+        "SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_NAME='did_optimizer_assignments'
+            AND COLUMN_NAME='stats_applied';")
+    if [[ "$stats_applied_count" == '0' ]]; then
+        mysql --protocol=socket --database="$DB_NAME" -e \
+            "ALTER TABLE did_optimizer_assignments
+               ADD COLUMN stats_applied ENUM('Y','N') NOT NULL DEFAULT 'N';"
+    fi
+
+    for prior_column_def in \
+        'prior_sample:INT UNSIGNED NOT NULL DEFAULT 0' \
+        'prior_human:INT UNSIGNED NOT NULL DEFAULT 0' \
+        'prior_good:INT UNSIGNED NOT NULL DEFAULT 0' \
+        'prior_seconds_sum:BIGINT UNSIGNED NOT NULL DEFAULT 0'
+    do
+        prior_column_name="${prior_column_def%%:*}"
+        prior_column_type="${prior_column_def#*:}"
+        prior_column_count=$(mysql --protocol=socket --batch --skip-column-names --database="$DB_NAME" -e \
+            "SELECT COUNT(*) FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_NAME='did_optimizer_campaign_state'
+                AND COLUMN_NAME='$prior_column_name';")
+        if [[ "$prior_column_count" == '0' ]]; then
+            mysql --protocol=socket --database="$DB_NAME" -e \
+                "ALTER TABLE did_optimizer_campaign_state ADD COLUMN $prior_column_name $prior_column_type;"
+        fi
+    done
+
     # Expand the early minimal reputation cache without discarding cached data.
     mysql --protocol=socket --database="$DB_NAME" -e \
         "ALTER TABLE did_optimizer_reputation_cache
@@ -238,14 +290,16 @@ install_database() {
 
 install_dialer() {
     local vicidial_path php_target source_agi_hash target_agi_hash source_php_hash target_php_hash
+    local source_hangup_hash target_hangup_hash
     require_command php
     require_command install
     require_command sha256sum
     require_command awk
     require_command perl
     require_command grep
-    [[ -r "$AGI_SOURCE" && -r "$PHP_SOURCE" && -r "$REPUTATION_INC_SOURCE" && -r "$QUICK_TEST_SOURCE" ]] \
-        || die 'AGI, PHP, reputation, or quick-test source is missing.'
+    [[ -r "$AGI_SOURCE" && -r "$HANGUP_AGI_SOURCE" && -r "$PHP_SOURCE" \
+       && -r "$REPUTATION_INC_SOURCE" && -r "$QUICK_TEST_SOURCE" ]] \
+        || die 'AGI, hangup AGI, PHP, reputation, or quick-test source is missing.'
     if ((REPUTATION_CRON_ENABLED)); then
         [[ -r "$REPUTATION_CRON_SOURCE" ]] || die 'Reputation cron source is missing.'
     fi
@@ -259,9 +313,11 @@ install_dialer() {
         || die 'VARserver_ip is missing from /etc/astguiclient.conf.'
 
     perl -c "$AGI_SOURCE"
+    perl -c "$HANGUP_AGI_SOURCE"
     php -l "$PHP_SOURCE"
     php -l "$REPUTATION_INC_SOURCE"
     install -o asterisk -g asterisk -m 0750 "$AGI_SOURCE" "$AGI_TARGET"
+    install -o asterisk -g asterisk -m 0750 "$HANGUP_AGI_SOURCE" "$HANGUP_AGI_TARGET"
     install -o root -g root -m 0755 "$PHP_SOURCE" "$php_target"
     # did_optimizer_reputation.inc.php requires dbconnect_mysqli.php via
     # __DIR__, so it must live next to admin_did_optimizer_pool.php in the
@@ -269,10 +325,12 @@ install_dialer() {
     install -o root -g root -m 0644 "$REPUTATION_INC_SOURCE" "$vicidial_path/did_optimizer_reputation.inc.php"
     install -d -o root -g root -m 0755 "$MAINTENANCE_DIR"
     install -o root -g root -m 0644 "$AGI_SOURCE" "$MAINTENANCE_DIR/did_optimizer.agi"
+    install -o root -g root -m 0644 "$HANGUP_AGI_SOURCE" "$MAINTENANCE_DIR/did_optimizer_hangup.agi"
     install -o root -g root -m 0644 "$PHP_SOURCE" "$MAINTENANCE_DIR/admin_did_optimizer_pool.php"
     install -o root -g root -m 0644 "$REPUTATION_INC_SOURCE" "$MAINTENANCE_DIR/did_optimizer_reputation.inc.php"
     install -o root -g root -m 0755 "$QUICK_TEST_SOURCE" "$MAINTENANCE_DIR/quick-test.sh"
     perl -c "$AGI_TARGET"
+    perl -c "$HANGUP_AGI_TARGET"
     php -l "$php_target"
 
     if ((REPUTATION_CRON_ENABLED)); then
@@ -291,12 +349,15 @@ install_dialer() {
 
     source_agi_hash=$(sha256sum "$AGI_SOURCE" | awk '{print $1}')
     target_agi_hash=$(sha256sum "$AGI_TARGET" | awk '{print $1}')
+    source_hangup_hash=$(sha256sum "$HANGUP_AGI_SOURCE" | awk '{print $1}')
+    target_hangup_hash=$(sha256sum "$HANGUP_AGI_TARGET" | awk '{print $1}')
     source_php_hash=$(sha256sum "$PHP_SOURCE" | awk '{print $1}')
     target_php_hash=$(sha256sum "$php_target" | awk '{print $1}')
     [[ "$source_agi_hash" == "$target_agi_hash" ]] || die 'Installed AGI hash mismatch.'
+    [[ "$source_hangup_hash" == "$target_hangup_hash" ]] || die 'Installed hangup AGI hash mismatch.'
     [[ "$source_php_hash" == "$target_php_hash" ]] || die 'Installed PHP hash mismatch.'
-    printf 'Dialer/web node ready: AGI=%s admin=%s test=%s/quick-test.sh\n' \
-        "$AGI_TARGET" "$php_target" "$MAINTENANCE_DIR"
+    printf 'Dialer/web node ready: AGI=%s hangup=%s admin=%s test=%s/quick-test.sh\n' \
+        "$AGI_TARGET" "$HANGUP_AGI_TARGET" "$php_target" "$MAINTENANCE_DIR"
 }
 
 [[ "$ROLE" == 'database' ]] && install_database
@@ -310,7 +371,11 @@ printf '%s\n' \
     '' \
     'Add after call_log and immediately before Dial() on every dialer node:' \
     ' same => n,AGI(did_optimizer.agi,${campaign_id},${dialed_number},${UNIQUEID},${lead_id})' \
-    ' same => n,NoOp(DID optimizer: ${DIDOPT_STATUS} ${DIDOPT_SELECTED} ${DIDOPT_REASON})'
+    ' same => n,NoOp(DID optimizer: ${DIDOPT_STATUS} ${DIDOPT_SELECTED} ${DIDOPT_REASON})' \
+    '' \
+    'Add to the h extension on the same route(s) - required for DID scores to' \
+    'ever update; without it, selection falls back to ordering by last_used only:' \
+    ' exten => h,1,AGI(did_optimizer_hangup.agi,${UNIQUEID})'
 
 if [[ "$ROLE" == 'dialer' ]]; then
     chmod u+x "$MAINTENANCE_DIR/quick-test.sh"

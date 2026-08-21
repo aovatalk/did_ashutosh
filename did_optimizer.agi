@@ -12,15 +12,6 @@ $| = 1;
 my $SCRIPT_NAME          = 'did_optimizer.agi';
 my $CONFIG_FILE         = '/etc/astguiclient.conf';
 my $DEBUG               = exists $ENV{'DIDOPT_DEBUG'} ? ($ENV{'DIDOPT_DEBUG'} ? 1 : 0) : 0;
-my $MAX_SAMPLE_SIZE     = 20;
-my $MIN_SUCCESS_DURATION = 5; # A successful call must be strictly greater than this.
-my $BAYES_PRIOR_STRENGTH = 5;
-my $DURATION_SCORE_CAP   = 120; # Durations at or above this many seconds receive full credit.
-my $HIGH_PERFORMER_BAND  = 0.05; # Scores within five points of the best are treated as similar.
-my $GOOD_RATE_WEIGHT     = 0.40;
-my $HUMAN_RATE_WEIGHT    = 0.24;
-my $DURATION_WEIGHT      = 0.16;
-my $REPUTATION_WEIGHT    = 0.20;
 my $DEADLOCK_MAX_ATTEMPTS = 4; # 1213 deadlock / 1205 lock wait timeout only.
 
 my $dbh;
@@ -258,12 +249,14 @@ sub validate_call_context {
 }
 
 sub get_candidate_dids {
-    my ($db, $campaign, $lock_rows) = @_;
+    my ($db, $campaign) = @_;
     my $sql = q{
         SELECT p.did_id, p.did_number, p.campaign_id, p.country_code,
                p.admin_priority, p.total_assignments,
                CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END AS effective_calls_today,
-               p.daily_limit, p.last_used, r.reputation
+               p.daily_limit, p.last_used, r.reputation,
+               p.sample_size, p.human_answered_calls, p.good_calls,
+               p.answered_seconds_sum, p.performance_score
           FROM did_optimizer_pool p
           LEFT JOIN did_optimizer_reputation_cache r
             ON r.did_number = p.did_number
@@ -275,7 +268,6 @@ sub get_candidate_dids {
                 CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END < p.daily_limit)
          ORDER BY p.did_id
     };
-    $sql .= ' FOR UPDATE' if $lock_rows;
     my $rows = $db->selectall_arrayref($sql, { Slice => {} }, $campaign);
 
     my @valid;
@@ -394,299 +386,86 @@ sub get_best_geo_pool {
     return (\@pool, $best_rank);
 }
 
-sub database_supports_window_functions {
-    my ($db) = @_;
-    my ($version) = $db->selectrow_array('SELECT VERSION()');
-    $version ||= '';
-    if ($version =~ /MariaDB/i) {
-        return ($version =~ /^(\d+)\.(\d+)/ && ($1 > 10 || ($1 == 10 && $2 >= 2))) ? 1 : 0;
-    }
-    return ($version =~ /^(\d+)\.(\d+)/ && $1 >= 8) ? 1 : 0;
-}
+# Atomically reserves the best-scoring eligible DID from a candidate did_id
+# list: performance_score (kept current by did_optimizer_hangup.agi on every
+# completed call) and last_used are read directly off did_optimizer_pool, no
+# scoring math or vicidial_log query happens here. FOR UPDATE SKIP LOCKED lets
+# concurrent calls each grab a different row instead of queueing behind a
+# single campaign lock; a row already reserved by another in-flight call is
+# simply skipped rather than blocked on. Tries excluding $exclude_did_number
+# (the campaign's last-used DID) first, then retries allowing it, same
+# fallback order as before. Returns (reserved_row, previous_excluded) or ()
+# if nothing could be reserved (all eligible rows currently locked, or none
+# eligible).
+sub reserve_did {
+    my ($db, $did_ids, $exclude_did_number) = @_;
+    return () unless @$did_ids;
+    my $placeholders = join(',', ('?') x scalar(@$did_ids));
 
-# VICIdial-version-specific completed-call mapping is isolated here.
-# unique_call_id -> vicidial_log.uniqueid
-# result status  -> vicidial_log.status
-# duration       -> vicidial_log.length_in_sec
-# human answer   -> campaign status override, then global status definition
-sub get_completed_call_results {
-    my ($db, $campaign, $dids) = @_;
-    my %stats;
-    for my $did (@$dids) {
-        $stats{$did} = {
-            sample_size              => 0,
-            human_answered_calls     => 0,
-            good_calls               => 0,
-            human_answer_rate        => 0,
-            good_call_rate           => 0,
-            average_answered_duration => 0,
+    for my $exclude_prev (($exclude_did_number ? (1) : ()), 0) {
+        my $sql = qq{
+            SELECT did_id, did_number, sample_size, human_answered_calls, good_calls,
+                   answered_seconds_sum, performance_score
+              FROM did_optimizer_pool
+             WHERE did_id IN ($placeholders)
+               AND enabled = 'Y'
+               AND (daily_limit = 0 OR
+                    CASE WHEN usage_date = CURDATE() THEN calls_today ELSE 0 END < daily_limit)
         };
-    }
-    return \%stats unless @$dids;
-
-    my $placeholders = join(',', ('?') x scalar(@$dids));
-    my $human_sql = q{
-        COALESCE(
-            (SELECT vcs.human_answered
-               FROM vicidial_campaign_statuses vcs
-              WHERE vcs.campaign_id = a.campaign_id
-                AND vcs.status = v.status
-              LIMIT 1),
-            (SELECT vs.human_answered
-               FROM vicidial_statuses vs
-              WHERE vs.status = v.status
-              LIMIT 1),
-            'N'
-        )
-    };
-
-    my ($sql, @bind);
-    if (database_supports_window_functions($db)) {
-        $sql = qq{
-            SELECT did_number,
-                   COUNT(*) AS sample_size,
-                   SUM(CASE WHEN human_answered = 'Y' THEN 1 ELSE 0 END) AS human_answered_calls,
-                   SUM(CASE WHEN human_answered = 'Y' AND length_in_sec > ? THEN 1 ELSE 0 END) AS good_calls,
-                   AVG(CASE WHEN human_answered = 'Y' THEN length_in_sec ELSE NULL END) AS average_answered_duration
-              FROM (
-                    SELECT completed.*,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY did_number
-                               ORDER BY call_date DESC, assignment_id DESC
-                           ) AS sample_rank
-                      FROM (
-                            SELECT a.assignment_id, a.did_number, v.call_date,
-                                   COALESCE(v.length_in_sec, 0) AS length_in_sec,
-                                   $human_sql AS human_answered
-                              FROM did_optimizer_assignments a
-                              JOIN vicidial_log v
-                                ON v.uniqueid = a.unique_call_id
-                               AND v.campaign_id = a.campaign_id
-                             WHERE a.campaign_id = ?
-                               AND a.callerid_applied = 'Y'
-                               AND a.did_number IN ($placeholders)
-                           ) completed
-                   ) ranked
-             WHERE sample_rank <= ?
-             GROUP BY did_number
-        };
-        @bind = ($MIN_SUCCESS_DURATION, $campaign, @$dids, $MAX_SAMPLE_SIZE);
-    }
-    else {
-        # Compatible path for older MySQL/MariaDB versions without ROW_NUMBER().
-        # MySQL/MariaDB explicitly document that the evaluation order of
-        # user-variable assignments within a single SELECT list is undefined,
-        # so a session-variable ranking hack is not relied upon here. Instead,
-        # each candidate DID gets its own indexed "ORDER BY ... LIMIT" branch
-        # (using idx_didopt_assignment_did_recent), and the branches are
-        # combined with UNION ALL into a single round trip. This is both
-        # correct (no evaluation-order dependency) and bounded (each branch
-        # stops at MAX_SAMPLE_SIZE via an index range scan, regardless of how
-        # much history a DID accumulates over time).
-        my @branches;
-        @bind = ($MIN_SUCCESS_DURATION);
-        for my $did (@$dids) {
-            push @branches, qq{
-                (SELECT a.did_number,
-                        COALESCE(v.length_in_sec, 0) AS length_in_sec,
-                        $human_sql AS human_answered
-                   FROM did_optimizer_assignments a
-                   JOIN vicidial_log v
-                     ON v.uniqueid = a.unique_call_id
-                    AND v.campaign_id = a.campaign_id
-                  WHERE a.campaign_id = ?
-                    AND a.callerid_applied = 'Y'
-                    AND a.did_number = ?
-                  ORDER BY v.call_date DESC, a.assignment_id DESC
-                  LIMIT ?)
-            };
-            push @bind, $campaign, $did, $MAX_SAMPLE_SIZE;
+        my @bind = @$did_ids;
+        if ($exclude_prev) {
+            $sql .= ' AND did_number <> ?';
+            push @bind, $exclude_did_number;
         }
-        $sql = qq{
-            SELECT did_number,
-                   COUNT(*) AS sample_size,
-                   SUM(CASE WHEN human_answered = 'Y' THEN 1 ELSE 0 END) AS human_answered_calls,
-                   SUM(CASE WHEN human_answered = 'Y' AND length_in_sec > ? THEN 1 ELSE 0 END) AS good_calls,
-                   AVG(CASE WHEN human_answered = 'Y' THEN length_in_sec ELSE NULL END) AS average_answered_duration
-              FROM ( } . join(' UNION ALL ', @branches) . qq{ ) ranked
-             GROUP BY did_number
+        $sql .= q{
+             ORDER BY performance_score DESC, last_used ASC, did_id ASC
+             LIMIT 1
+             FOR UPDATE SKIP LOCKED
         };
+        my $row = $db->selectrow_hashref($sql, undef, @bind);
+        next unless $row;
+
+        my $updated = $db->do(q{
+            UPDATE did_optimizer_pool
+               SET calls_today = IF(usage_date = CURDATE(), calls_today + 1, 1),
+                   usage_date = CURDATE(),
+                   total_assignments = total_assignments + 1,
+                   last_used = NOW()
+             WHERE did_id = ?
+               AND enabled = 'Y'
+               AND (daily_limit = 0 OR
+                    CASE WHEN usage_date = CURDATE() THEN calls_today ELSE 0 END < daily_limit)
+        }, undef, $row->{'did_id'});
+        return ($row, $exclude_prev) if $updated;
     }
-
-    my $rows = $db->selectall_arrayref($sql, { Slice => {} }, @bind);
-    for my $row (@$rows) {
-        my $sample = $row->{'sample_size'} || 0;
-        my $human = $row->{'human_answered_calls'} || 0;
-        my $good = $row->{'good_calls'} || 0;
-        $stats{$row->{'did_number'}} = {
-            sample_size               => $sample + 0,
-            human_answered_calls      => $human + 0,
-            good_calls                => $good + 0,
-            human_answer_rate         => $sample ? $human / $sample : 0,
-            good_call_rate            => $sample ? $good / $sample : 0,
-            average_answered_duration => ($row->{'average_answered_duration'} || 0) + 0,
-        };
-    }
-    return \%stats;
-}
-
-sub is_human_answered {
-    my ($db, $campaign, $status) = @_;
-    my ($answer) = $db->selectrow_array(
-        q{SELECT COALESCE(
-              (SELECT human_answered FROM vicidial_campaign_statuses
-                WHERE campaign_id = ? AND status = ? LIMIT 1),
-              (SELECT human_answered FROM vicidial_statuses
-                WHERE status = ? LIMIT 1), 'N')},
-        undef, $campaign, $status, $status
-    );
-    return ($answer || 'N') eq 'Y';
-}
-
-sub calculate_performance_scores {
-    my ($candidates, $stats) = @_;
-
-    my ($total_sample, $total_human, $total_good, $total_answered_seconds) = (0, 0, 0, 0);
-    for my $candidate (@$candidates) {
-        my $metric = $stats->{$candidate->{'did_number'}} ||= {
-            sample_size => 0, human_answered_calls => 0, good_calls => 0,
-            human_answer_rate => 0, good_call_rate => 0,
-            average_answered_duration => 0,
-        };
-        $total_sample += $metric->{'sample_size'} || 0;
-        $total_human += $metric->{'human_answered_calls'} || 0;
-        $total_good += $metric->{'good_calls'} || 0;
-        $total_answered_seconds += ($metric->{'average_answered_duration'} || 0)
-                                 * ($metric->{'human_answered_calls'} || 0);
-    }
-
-    # Empirical pool priors let mature campaign data define the baseline. The
-    # neutral fallbacks apply only while the campaign has no completed history.
-    my $prior_good_rate = $total_sample ? $total_good / $total_sample : 0.50;
-    my $prior_human_rate = $total_sample ? $total_human / $total_sample : 0.50;
-    my $prior_duration = $total_human ? $total_answered_seconds / $total_human : 30;
-
-    for my $candidate (@$candidates) {
-        my $metric = $stats->{$candidate->{'did_number'}};
-        my $sample = $metric->{'sample_size'} || 0;
-        my $human = $metric->{'human_answered_calls'} || 0;
-        my $good = $metric->{'good_calls'} || 0;
-        my $answered_seconds = ($metric->{'average_answered_duration'} || 0) * $human;
-
-        my $smoothed_good = ($good + $BAYES_PRIOR_STRENGTH * $prior_good_rate)
-                          / ($sample + $BAYES_PRIOR_STRENGTH);
-        my $smoothed_human = ($human + $BAYES_PRIOR_STRENGTH * $prior_human_rate)
-                           / ($sample + $BAYES_PRIOR_STRENGTH);
-        my $smoothed_duration = ($answered_seconds + $BAYES_PRIOR_STRENGTH * $prior_duration)
-                              / ($human + $BAYES_PRIOR_STRENGTH);
-        my $duration_component = $smoothed_duration / $DURATION_SCORE_CAP;
-        $duration_component = 1 if $duration_component > 1;
-        my $reputation = lc($candidate->{'reputation'} || '');
-        my $reputation_component = $reputation eq 'positive' ? 1
-                                 : $reputation eq 'negative' ? 0
-                                 : 0.50;
-
-        $metric->{'smoothed_good_call_rate'} = $smoothed_good;
-        $metric->{'smoothed_human_answer_rate'} = $smoothed_human;
-        $metric->{'smoothed_average_duration'} = $smoothed_duration;
-        $metric->{'reputation_component'} = $reputation_component;
-        $metric->{'reputation'} = $candidate->{'reputation'} || 'Unknown';
-        $metric->{'performance_score'} =
-              $GOOD_RATE_WEIGHT * $smoothed_good
-            + $HUMAN_RATE_WEIGHT * $smoothed_human
-            + $DURATION_WEIGHT * $duration_component
-            + $REPUTATION_WEIGHT * $reputation_component;
-    }
-}
-
-sub choose_candidate {
-    my ($candidates, $stats, $previous_did, $destination_profile, $geo_profiles) = @_;
-
-    my ($geo_pool, $best_geo_rank) = get_best_geo_pool(
-        $candidates, $destination_profile, $geo_profiles
-    );
-    my @pool = @$geo_pool;
-    my $used_local_pool = $best_geo_rank ? 1 : 0;
-
-    my $previous_excluded = 0;
-    if ($previous_did) {
-        my @without_previous = grep { $_->{'did_number'} ne $previous_did } @pool;
-        if (@without_previous) {
-            @pool = @without_previous;
-            $previous_excluded = 1;
-        }
-    }
-    return unless @pool;
-
-    calculate_performance_scores(\@pool, $stats);
-    my $best_score = 0;
-    for my $candidate (@pool) {
-        my $score = $stats->{$candidate->{'did_number'}}->{'performance_score'} || 0;
-        $best_score = $score if $score > $best_score;
-    }
-
-    # Keep only candidates whose Bayesian composite score is effectively near
-    # the leader, then spread traffic within that quality tier using LRU.
-    my @high_performers = grep {
-        ($stats->{$_->{'did_number'}}->{'performance_score'} || 0)
-            >= $best_score - $HIGH_PERFORMER_BAND
-    } @pool;
-    @high_performers = sort {
-        (($a->{'last_used'} || '0000-00-00 00:00:00')
-            cmp ($b->{'last_used'} || '0000-00-00 00:00:00'))
-        || $stats->{$b->{'did_number'}}->{'performance_score'}
-            <=> $stats->{$a->{'did_number'}}->{'performance_score'}
-        || $a->{'did_id'} <=> $b->{'did_id'}
-    } @high_performers;
-
-    my $selected = $high_performers[0];
-    my $reason = $used_local_pool
-        ? 'HIGH_PERFORMING_LOCAL_LRU'
-        : 'HIGH_PERFORMING_CAMPAIGN_LRU';
-
-    return ($selected, {
-        reason             => $reason,
-        used_local_pool    => $used_local_pool,
-        previous_excluded  => $previous_excluded,
-        candidate_count    => scalar(@pool),
-        high_performer_count => scalar(@high_performers),
-        best_score          => $best_score,
-        geo_match_rank      => $best_geo_rank,
-    });
+    return ();
 }
 
 sub select_and_record {
     my ($db, $call) = @_;
     my $campaign = $call->{'campaign_id'};
 
-    # Historical statistics are intentionally loaded before the lock so that
-    # the per-campaign transaction stays short.
-    my $initial = get_candidate_dids($db, $campaign, 0);
-    abort_request('NO_DID', 'No enabled DID remains below its daily limit') unless @$initial;
-    my @initial_numbers = map { $_->{'did_number'} } @$initial;
-    my $geo_profiles = get_geo_profiles($db, [$call->{'destination'}, @initial_numbers]);
+    my $candidates = get_candidate_dids($db, $campaign);
+    abort_request('NO_DID', 'No enabled DID remains below its daily limit') unless @$candidates;
+    my @candidate_numbers = map { $_->{'did_number'} } @$candidates;
+    my $geo_profiles = get_geo_profiles($db, [$call->{'destination'}, @candidate_numbers]);
     my $destination_npanxx = get_npanxx($call->{'destination'});
     my $destination_profile = $geo_profiles->{$destination_npanxx};
-    my ($initial_geo_pool) = get_best_geo_pool($initial, $destination_profile, $geo_profiles);
-    my @scoring_numbers = map { $_->{'did_number'} } @$initial_geo_pool;
-    my $stats = get_completed_call_results($db, $campaign, \@scoring_numbers);
-    calculate_performance_scores($initial_geo_pool, $stats);
-    for my $candidate (@$initial_geo_pool) {
-        my $metric = $stats->{$candidate->{'did_number'}};
+    my ($geo_pool, $best_geo_rank) = get_best_geo_pool($candidates, $destination_profile, $geo_profiles);
+
+    for my $candidate (@$candidates) {
         agi_verbose(
             sprintf(
-                'candidate DID=%s npanxx=%s sample=%d human=%d good=%d raw_good=%.4f bayes_good=%.4f bayes_human=%.4f avg_answered=%.1f bayes_duration=%.1f reputation=%s score=%.4f',
+                'candidate DID=%s npanxx=%s geo_rank=%d sample=%d human=%d good=%d avg_answered=%.1f reputation=%s score=%.4f',
                 $candidate->{'did_number'}, $candidate->{'npanxx'} || 'NONE',
-                $metric->{'sample_size'} || 0,
-                $metric->{'human_answered_calls'} || 0,
-                $metric->{'good_calls'} || 0,
-                $metric->{'good_call_rate'} || 0,
-                $metric->{'smoothed_good_call_rate'} || 0,
-                $metric->{'smoothed_human_answer_rate'} || 0,
-                $metric->{'average_answered_duration'} || 0,
-                $metric->{'smoothed_average_duration'} || 0,
-                $metric->{'reputation'} || 'Unknown',
-                $metric->{'performance_score'} || 0
+                $candidate->{'geo_match_rank'} || 0,
+                $candidate->{'sample_size'} || 0,
+                $candidate->{'human_answered_calls'} || 0,
+                $candidate->{'good_calls'} || 0,
+                $candidate->{'human_answered_calls'}
+                    ? $candidate->{'answered_seconds_sum'} / $candidate->{'human_answered_calls'} : 0,
+                $candidate->{'reputation'} || 'Unknown',
+                $candidate->{'performance_score'} || 0
             ),
             0
         );
@@ -694,7 +473,7 @@ sub select_and_record {
 
     for (my $attempt = 1; ; $attempt++) {
         my @result = eval {
-            select_and_record_txn($db, $campaign, $call, $stats, $destination_profile, $geo_profiles)
+            select_and_record_txn($db, $campaign, $call, $candidates, $geo_pool, $best_geo_rank)
         };
         return @result if !$@;
 
@@ -709,57 +488,58 @@ sub select_and_record {
 }
 
 sub select_and_record_txn {
-    my ($db, $campaign, $call, $stats, $destination_profile, $geo_profiles) = @_;
-
-    $db->begin_work();
-    $db->do(
-        q{INSERT IGNORE INTO did_optimizer_campaign_state (campaign_id)
-          VALUES (?)},
-        undef, $campaign
-    );
-    my ($previous_did) = $db->selectrow_array(
-        q{SELECT last_did FROM did_optimizer_campaign_state
-          WHERE campaign_id = ? FOR UPDATE},
-        undef, $campaign
-    );
+    my ($db, $campaign, $call, $candidates, $geo_pool, $best_geo_rank) = @_;
 
     # Idempotency: a repeated AGI execution for the same call reuses its first
-    # committed DID and never increments counters twice.
+    # committed DID and never increments counters twice. No lock needed here -
+    # unique_call_id is unique-keyed, so a concurrent duplicate insert fails
+    # on that constraint instead of racing past this check.
     my $existing = $db->selectrow_hashref(
-        q{SELECT assignment_id, did_number, selection_reason
+        q{SELECT assignment_id, did_number
           FROM did_optimizer_assignments
-          WHERE unique_call_id = ? FOR UPDATE},
+          WHERE unique_call_id = ?},
         undef, $call->{'unique_call_id'}
     );
     if ($existing) {
-        $db->commit();
-        my $existing_stats = $stats->{$existing->{'did_number'}} || {
-            sample_size => 0, human_answered_calls => 0, good_calls => 0,
-            human_answer_rate => 0, good_call_rate => 0,
-            average_answered_duration => 0,
-        };
         return ({
             did_id => undef,
             did_number => $existing->{'did_number'},
             npanxx => get_npanxx($existing->{'did_number'}),
-        }, $existing_stats, {
+        }, {
+            sample_size => 0, human_answered_calls => 0, good_calls => 0,
+            average_answered_duration => 0, performance_score => 0,
+        }, {
             reason => 'IDEMPOTENT_REUSE', used_local_pool => 0,
             previous_excluded => 0, candidate_count => 1, geo_match_rank => 0,
-            high_performer_count => 1,
         }, $existing->{'assignment_id'});
     }
 
-    # Recheck eligibility after acquiring the campaign lock. Pool rows are also
-    # locked until the counter update commits.
-    my $candidates = get_candidate_dids($db, $campaign, 1);
-    abort_request('NO_DID', 'No eligible DID remained after transactional recheck')
-        unless @$candidates;
-
-    my ($selected, $decision) = choose_candidate(
-        $candidates, $stats, $previous_did, $destination_profile, $geo_profiles
+    # Plain read, not FOR UPDATE: the anti-repeat exclusion below is
+    # best-effort under heavy concurrency (two simultaneous calls can in rare
+    # cases both avoid a stale previous_did rather than each other's pick),
+    # traded for not serializing every call in a campaign behind one row lock.
+    my ($previous_did) = $db->selectrow_array(
+        q{SELECT last_did FROM did_optimizer_campaign_state WHERE campaign_id = ?},
+        undef, $campaign
     );
-    abort_request('NO_DID', 'No DID could be selected') unless $selected;
 
+    $db->begin_work();
+
+    my @geo_ids = map { $_->{'did_id'} } @$geo_pool;
+    my @all_ids = map { $_->{'did_id'} } @$candidates;
+
+    my ($reserved, $previous_excluded) = reserve_did($db, \@geo_ids, $previous_did);
+    my $used_local_pool = $best_geo_rank ? 1 : 0;
+    unless ($reserved) {
+        ($reserved, $previous_excluded) = reserve_did($db, \@all_ids, $previous_did);
+        $used_local_pool = 0;
+    }
+    unless ($reserved) {
+        $db->rollback();
+        abort_request('NO_DID', 'No DID could be reserved (all eligible rows locked or ineligible)');
+    }
+
+    my $reason = $used_local_pool ? 'HIGH_SCORE_LOCAL_LRU' : 'HIGH_SCORE_CAMPAIGN_LRU';
     my $insert = $db->prepare(q{
         INSERT INTO did_optimizer_assignments
             (unique_call_id, campaign_id, server_ip, lead_id, auto_call_id, did_number,
@@ -768,33 +548,34 @@ sub select_and_record_txn {
     });
     $insert->execute(
         $call->{'unique_call_id'}, $campaign, $call->{'server_ip'}, $call->{'lead_id'},
-        $call->{'auto_call_id'}, $selected->{'did_number'},
-        $call->{'destination'}, $decision->{'reason'}
+        $call->{'auto_call_id'}, $reserved->{'did_number'},
+        $call->{'destination'}, $reason
     );
     my $assignment_id = $db->{'mysql_insertid'};
 
-    my $updated = $db->do(q{
-        UPDATE did_optimizer_pool
-           SET calls_today = IF(usage_date = CURDATE(), calls_today + 1, 1),
-               usage_date = CURDATE(),
-               total_assignments = total_assignments + 1,
-               last_used = NOW()
-         WHERE did_id = ?
-           AND campaign_id = ?
-           AND enabled = 'Y'
-           AND (daily_limit = 0 OR
-                CASE WHEN usage_date = CURDATE() THEN calls_today ELSE 0 END < daily_limit)
-    }, undef, $selected->{'did_id'}, $campaign);
-    die 'Selected DID became ineligible during update' unless $updated && $updated == 1;
-
+    $db->do(q{INSERT IGNORE INTO did_optimizer_campaign_state (campaign_id) VALUES (?)}, undef, $campaign);
     $db->do(q{
         UPDATE did_optimizer_campaign_state
            SET last_did = ?, updated_at = CURRENT_TIMESTAMP
          WHERE campaign_id = ?
-    }, undef, $selected->{'did_number'}, $campaign);
+    }, undef, $reserved->{'did_number'}, $campaign);
 
     $db->commit();
-    return ($selected, $stats->{$selected->{'did_number'}}, $decision, $assignment_id);
+
+    my $human = $reserved->{'human_answered_calls'} || 0;
+    my $metrics = {
+        sample_size               => $reserved->{'sample_size'} || 0,
+        human_answered_calls      => $human,
+        good_calls                => $reserved->{'good_calls'} || 0,
+        average_answered_duration => $human ? ($reserved->{'answered_seconds_sum'} || 0) / $human : 0,
+        performance_score         => $reserved->{'performance_score'} || 0,
+    };
+    my $decision = {
+        reason => $reason, used_local_pool => $used_local_pool,
+        previous_excluded => $previous_excluded, candidate_count => scalar(@$candidates),
+        geo_match_rank => $best_geo_rank,
+    };
+    return ($reserved, $metrics, $decision, $assignment_id);
 }
 
 sub publish_success_variables {
@@ -850,8 +631,7 @@ sub main {
         'selection local_pool=' . ($decision->{'used_local_pool'} ? 'Y' : 'N')
         . ' geo_rank=' . ($decision->{'geo_match_rank'} || 0)
         . ' previous_excluded=' . ($decision->{'previous_excluded'} ? 'Y' : 'N')
-        . ' candidates=' . ($decision->{'candidate_count'} || 0)
-        . ' high_performers=' . ($decision->{'high_performer_count'} || 0),
+        . ' candidates=' . ($decision->{'candidate_count'} || 0),
         0
     );
 

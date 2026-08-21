@@ -1,0 +1,300 @@
+#!/usr/bin/perl
+
+# did_optimizer_hangup.agi
+#
+# Bound to the dialplan's h (hangup) extension on every route that also runs
+# did_optimizer.agi, e.g.:
+#   exten => h,1,AGI(did_optimizer_hangup.agi,${UNIQUEID})
+#
+# This is the write side of the optimizer's score cache: it applies exactly
+# one completed call's outcome to that DID's running counters and recomputes
+# its performance_score, incrementally, in did_optimizer_pool. did_optimizer.agi
+# (the selection side) never aggregates vicidial_log or does Bayesian math in
+# the request path - it only reads performance_score and reserves a row
+# (FOR UPDATE SKIP LOCKED). See did_optimizer.agi for the reservation query.
+#
+# The Bayesian prior (see calculate_score below) is a running campaign-wide
+# total in did_optimizer_campaign_state, updated here alongside the DID's own
+# counters, rather than recomputed per call from whichever candidate subset
+# happened to be under comparison. That is a deliberate simplification versus
+# the AGI's old per-call prior: it trades slightly coarser smoothing for the
+# prior being cheap to maintain (one running total, not an aggregate query).
+#
+# Runtime dependencies: Perl, DBI, DBD::mysql, Asterisk AGI, VICIdial database.
+
+use strict;
+use warnings;
+use DBI;
+
+$| = 1;
+
+my $CONFIG_FILE           = '/etc/astguiclient.conf';
+my $DEBUG                 = exists $ENV{'DIDOPT_DEBUG'} ? ($ENV{'DIDOPT_DEBUG'} ? 1 : 0) : 0;
+my $MIN_SUCCESS_DURATION  = 5;   # A successful call must be strictly greater than this.
+my $BAYES_PRIOR_STRENGTH  = 5;
+my $DURATION_SCORE_CAP    = 120; # Durations at or above this many seconds receive full credit.
+my $GOOD_RATE_WEIGHT      = 0.40;
+my $HUMAN_RATE_WEIGHT     = 0.24;
+my $DURATION_WEIGHT       = 0.16;
+my $REPUTATION_WEIGHT     = 0.20;
+
+my $agi_ready = 0;
+my $dbh;
+
+sub read_agi_environment {
+    my %agi;
+    while (defined(my $line = <STDIN>)) {
+        $line =~ s/[\r\n]+$//;
+        last if $line eq '';
+        if ($line =~ /^agi_([^:]+):\s*(.*)$/) {
+            $agi{$1} = $2;
+        }
+    }
+    $agi_ready = 1;
+    return \%agi;
+}
+
+sub agi_quote {
+    my ($value) = @_;
+    $value = '' unless defined $value;
+    $value =~ s/[\r\n\x00-\x1f]+/ /g;
+    $value =~ s/\\/\\\\/g;
+    $value =~ s/"/\\"/g;
+    return qq{"$value"};
+}
+
+sub agi_command {
+    my ($command) = @_;
+    return (undef, 'AGI environment not available') unless $agi_ready;
+    print STDOUT $command . "\n";
+    my $response = <STDIN>;
+    return (undef, 'No response from Asterisk') unless defined $response;
+    $response =~ s/[\r\n]+$//;
+    return ($1 + 0, $response) if $response =~ /^200\s+result=(-?\d+)/;
+    return (undef, $response);
+}
+
+sub agi_verbose {
+    my ($message, $always) = @_;
+    return unless $always || $DEBUG;
+    agi_command('VERBOSE ' . agi_quote('DIDOPT_HANGUP: ' . ($message // '')) . ' 1');
+}
+
+sub clean_argument {
+    my ($value) = @_;
+    return '' unless defined $value;
+    $value =~ s/^\s+|\s+$//g;
+    return '' if $value =~ /^(?:NULL|NONE|UNDEFINED)$/i;
+    return $value;
+}
+
+sub load_vicidial_config {
+    my ($path) = @_;
+    open(my $fh, '<', $path) or die "Cannot open $path: $!";
+    my %config;
+    while (my $line = <$fh>) {
+        $line =~ s/[\r\n]+$//;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '' || $line =~ /^\s*[#;]/;
+        next unless $line =~ /^([A-Za-z0-9_]+)\s*=>?\s*(.*?)\s*$/;
+        $config{$1} = $2;
+    }
+    close($fh);
+    for my $required (qw(VARDB_server VARDB_database VARDB_user VARDB_pass)) {
+        die "Missing $required in $path" unless defined $config{$required} && $config{$required} ne '';
+    }
+    $config{'VARDB_port'} = 3306 unless $config{'VARDB_port'};
+    die 'Invalid VARDB_port' unless $config{'VARDB_port'} =~ /^\d{1,5}$/;
+    return \%config;
+}
+
+sub connect_database {
+    my ($config) = @_;
+    my $dsn = 'DBI:mysql:database=' . $config->{'VARDB_database'}
+            . ';host=' . $config->{'VARDB_server'}
+            . ';port=' . $config->{'VARDB_port'};
+    my $dbh = DBI->connect(
+        $dsn, $config->{'VARDB_user'}, $config->{'VARDB_pass'},
+        { RaiseError => 1, PrintError => 0, AutoCommit => 1, mysql_auto_reconnect => 0 }
+    );
+    $dbh->do('SET NAMES utf8 COLLATE utf8_unicode_ci') if $dbh;
+    return $dbh;
+}
+
+# Same exact-then-fallback correlation the admin page uses (uniqueid match
+# first; lead/campaign/destination/closest-time within a bounded window
+# otherwise), since VICIdial does not guarantee vicidial_log is keyed
+# identically to the channel that requested the DID.
+sub find_completed_call {
+    my ($db, $assignment) = @_;
+    my $row = $db->selectrow_hashref(
+        q{SELECT status, length_in_sec FROM vicidial_log
+           WHERE uniqueid = ? AND campaign_id = ?
+           LIMIT 1},
+        undef, $assignment->{'unique_call_id'}, $assignment->{'campaign_id'}
+    );
+    return $row if $row;
+    return undef unless defined $assignment->{'lead_id'};
+    return $db->selectrow_hashref(
+        q{SELECT status, length_in_sec FROM vicidial_log
+           WHERE lead_id = ? AND campaign_id = ?
+             AND RIGHT(phone_number, 10) = RIGHT(?, 10)
+             AND call_date BETWEEN ? - INTERVAL 2 MINUTE AND ? + INTERVAL 30 MINUTE
+           ORDER BY ABS(TIMESTAMPDIFF(SECOND, ?, call_date)), call_date DESC, uniqueid DESC
+           LIMIT 1},
+        undef, $assignment->{'lead_id'}, $assignment->{'campaign_id'}, $assignment->{'destination'},
+        $assignment->{'assigned_at'}, $assignment->{'assigned_at'}, $assignment->{'assigned_at'}
+    );
+}
+
+sub is_human_answered {
+    my ($db, $campaign, $status) = @_;
+    my ($answer) = $db->selectrow_array(
+        q{SELECT COALESCE(
+              (SELECT human_answered FROM vicidial_campaign_statuses
+                WHERE campaign_id = ? AND status = ? LIMIT 1),
+              (SELECT human_answered FROM vicidial_statuses
+                WHERE status = ? LIMIT 1), 'N')},
+        undef, $campaign, $status, $status
+    );
+    return ($answer || 'N') eq 'Y';
+}
+
+sub calculate_score {
+    my ($pool_row, $prior_row, $reputation) = @_;
+    my $sample = $pool_row->{'sample_size'} || 0;
+    my $human = $pool_row->{'human_answered_calls'} || 0;
+    my $good = $pool_row->{'good_calls'} || 0;
+    my $answered_seconds = $pool_row->{'answered_seconds_sum'} || 0;
+
+    my $prior_sample = $prior_row->{'prior_sample'} || 0;
+    my $prior_human = $prior_row->{'prior_human'} || 0;
+    my $prior_good_rate = $prior_sample ? ($prior_row->{'prior_good'} || 0) / $prior_sample : 0.50;
+    my $prior_human_rate = $prior_sample ? $prior_human / $prior_sample : 0.50;
+    my $prior_duration = $prior_human ? ($prior_row->{'prior_seconds_sum'} || 0) / $prior_human : 30;
+
+    my $smoothed_good = ($good + $BAYES_PRIOR_STRENGTH * $prior_good_rate)
+                      / ($sample + $BAYES_PRIOR_STRENGTH);
+    my $smoothed_human = ($human + $BAYES_PRIOR_STRENGTH * $prior_human_rate)
+                       / ($sample + $BAYES_PRIOR_STRENGTH);
+    my $smoothed_duration = ($answered_seconds + $BAYES_PRIOR_STRENGTH * $prior_duration)
+                          / ($human + $BAYES_PRIOR_STRENGTH);
+    my $duration_component = $smoothed_duration / $DURATION_SCORE_CAP;
+    $duration_component = 1 if $duration_component > 1;
+    my $reputation_lc = lc($reputation || '');
+    my $reputation_component = $reputation_lc eq 'positive' ? 1
+                             : $reputation_lc eq 'negative' ? 0
+                             : 0.50;
+
+    return $GOOD_RATE_WEIGHT * $smoothed_good
+         + $HUMAN_RATE_WEIGHT * $smoothed_human
+         + $DURATION_WEIGHT * $duration_component
+         + $REPUTATION_WEIGHT * $reputation_component;
+}
+
+sub main {
+    my $agi = read_agi_environment();
+    my $uniqueid = clean_argument($ARGV[0]) || clean_argument($agi->{'uniqueid'});
+    return unless $uniqueid;
+
+    my $config = load_vicidial_config($CONFIG_FILE);
+    $dbh = connect_database($config);
+    die 'Database connection returned no handle' unless $dbh;
+
+    # Only a committed, not-yet-counted assignment is eligible. An assignment
+    # whose callerid was never applied is excluded from scoring the same way
+    # it always has been.
+    my $assignment = $dbh->selectrow_hashref(
+        q{SELECT assignment_id, campaign_id, did_number, destination, lead_id, assigned_at
+            FROM did_optimizer_assignments
+           WHERE unique_call_id = ? AND callerid_applied = 'Y' AND stats_applied = 'N'},
+        undef, $uniqueid
+    );
+    unless ($assignment) {
+        agi_verbose("no pending assignment for uniqueid=$uniqueid", 0);
+        return;
+    }
+    $assignment->{'unique_call_id'} = $uniqueid;
+
+    my $completed = find_completed_call($dbh, $assignment);
+    unless ($completed) {
+        agi_verbose("no vicidial_log match yet for uniqueid=$uniqueid did=$assignment->{'did_number'}", 0);
+        return;
+    }
+
+    my $human = is_human_answered($dbh, $assignment->{'campaign_id'}, $completed->{'status'} || '');
+    my $length_in_sec = ($completed->{'length_in_sec'} || 0) + 0;
+    my $good = $human && $length_in_sec > $MIN_SUCCESS_DURATION;
+
+    $dbh->begin_work();
+
+    my $claimed = $dbh->do(
+        q{UPDATE did_optimizer_assignments SET stats_applied = 'Y'
+           WHERE assignment_id = ? AND stats_applied = 'N'},
+        undef, $assignment->{'assignment_id'}
+    );
+    unless ($claimed && $claimed == 1) {
+        # Another hangup hook execution already claimed this assignment.
+        $dbh->rollback();
+        return;
+    }
+
+    $dbh->do(q{
+        UPDATE did_optimizer_pool
+           SET sample_size = sample_size + 1,
+               human_answered_calls = human_answered_calls + ?,
+               good_calls = good_calls + ?,
+               answered_seconds_sum = answered_seconds_sum + ?
+         WHERE campaign_id = ? AND did_number = ?
+    }, undef, ($human ? 1 : 0), ($good ? 1 : 0), ($human ? $length_in_sec : 0),
+       $assignment->{'campaign_id'}, $assignment->{'did_number'});
+
+    $dbh->do(q{INSERT IGNORE INTO did_optimizer_campaign_state (campaign_id) VALUES (?)},
+        undef, $assignment->{'campaign_id'});
+    $dbh->do(q{
+        UPDATE did_optimizer_campaign_state
+           SET prior_sample = prior_sample + 1,
+               prior_human = prior_human + ?,
+               prior_good = prior_good + ?,
+               prior_seconds_sum = prior_seconds_sum + ?
+         WHERE campaign_id = ?
+    }, undef, ($human ? 1 : 0), ($good ? 1 : 0), ($human ? $length_in_sec : 0),
+       $assignment->{'campaign_id'});
+
+    my $pool_row = $dbh->selectrow_hashref(
+        q{SELECT did_id, sample_size, human_answered_calls, good_calls, answered_seconds_sum
+            FROM did_optimizer_pool WHERE campaign_id = ? AND did_number = ?},
+        undef, $assignment->{'campaign_id'}, $assignment->{'did_number'}
+    );
+    my $prior_row = $dbh->selectrow_hashref(
+        q{SELECT prior_sample, prior_human, prior_good, prior_seconds_sum
+            FROM did_optimizer_campaign_state WHERE campaign_id = ?},
+        undef, $assignment->{'campaign_id'}
+    );
+    my ($reputation) = $dbh->selectrow_array(
+        q{SELECT reputation FROM did_optimizer_reputation_cache
+           WHERE did_number = ? AND checked_at >= (NOW() - INTERVAL 15 MINUTE)},
+        undef, $assignment->{'did_number'}
+    );
+
+    if ($pool_row && $prior_row) {
+        my $score = calculate_score($pool_row, $prior_row, $reputation);
+        $dbh->do(q{UPDATE did_optimizer_pool SET performance_score = ? WHERE did_id = ?},
+            undef, $score, $pool_row->{'did_id'});
+        agi_verbose(
+            sprintf('did=%s human=%d good=%d duration=%d score=%.4f',
+                $assignment->{'did_number'}, $human ? 1 : 0, $good ? 1 : 0, $length_in_sec, $score),
+            0
+        );
+    }
+
+    $dbh->commit();
+}
+
+my $ok = eval { main(); 1 };
+unless ($ok) {
+    my $error = $@ || 'Unknown error';
+    eval { $dbh->rollback() if $dbh && !$dbh->{'AutoCommit'}; };
+    agi_verbose("error: $error", 1);
+}
+eval { $dbh->disconnect() if $dbh; };

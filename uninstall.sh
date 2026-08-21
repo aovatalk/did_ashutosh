@@ -5,6 +5,7 @@ set -Eeuo pipefail
 ROLE=""
 PURGE_DATA=0
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
+HANGUP_AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer_hangup.agi"
 MAINTENANCE_DIR="/usr/local/share/did-optimizer"
 REPUTATION_CRON_FILE="/etc/cron.d/did-optimizer-reputation"
 DB_NAME="asterisk"
@@ -69,6 +70,7 @@ remove_file() {
 }
 
 remove_file "$AGI_TARGET"
+remove_file "$HANGUP_AGI_TARGET"
 
 # Check every supported VICIdial web root so stale copies from a previous web
 # root migration are removed as well.
@@ -79,6 +81,7 @@ for web_root in /srv/www/htdocs /var/www/html /var/www; do
 done
 
 remove_file "$MAINTENANCE_DIR/did_optimizer.agi"
+remove_file "$MAINTENANCE_DIR/did_optimizer_hangup.agi"
 remove_file "$MAINTENANCE_DIR/admin_did_optimizer_pool.php"
 remove_file "$MAINTENANCE_DIR/did_optimizer_reputation.inc.php"
 remove_file "$MAINTENANCE_DIR/reputation_cron.php"
@@ -101,4 +104,4 @@ fi
 printf '%s\n' \
     'DID optimizer dialer uninstall completed successfully.' \
     '  Shared database: unchanged' \
-    '  Dialplan: unchanged (remove any AGI/NoOp lines manually if desired)'
+    '  Dialplan: unchanged (remove any AGI/NoOp/h-extension lines manually if desired)'

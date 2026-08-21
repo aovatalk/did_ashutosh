@@ -5,10 +5,12 @@ set -uo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DB_NAME="asterisk"
 AGI_SOURCE="$SCRIPT_DIR/did_optimizer.agi"
+HANGUP_AGI_SOURCE="$SCRIPT_DIR/did_optimizer_hangup.agi"
 PHP_SOURCE="$SCRIPT_DIR/admin_did_optimizer_pool.php"
 REPUTATION_INC_SOURCE="$SCRIPT_DIR/did_optimizer_reputation.inc.php"
 REPUTATION_CRON_SOURCE="$SCRIPT_DIR/reputation_cron.php"
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
+HANGUP_AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer_hangup.agi"
 REPUTATION_CRON_FILE="/etc/cron.d/did-optimizer-reputation"
 PHP_TARGET=""
 REPUTATION_INC_TARGET=""
@@ -110,7 +112,7 @@ else
     fail '/etc/astguiclient.conf is not readable'
 fi
 
-for required_file in "$AGI_SOURCE" "$PHP_SOURCE" "$AGI_TARGET" "$PHP_TARGET" \
+for required_file in "$AGI_SOURCE" "$HANGUP_AGI_SOURCE" "$PHP_SOURCE" "$AGI_TARGET" "$HANGUP_AGI_TARGET" "$PHP_TARGET" \
     "$REPUTATION_INC_SOURCE" "$REPUTATION_INC_TARGET"; do
     check_file "$required_file"
 done
@@ -156,6 +158,20 @@ else
     fail 'deployed AGI is missing, non-executable, or invalid Perl source'
 fi
 
+if [[ -x "$HANGUP_AGI_TARGET" ]] \
+    && [[ $(head -n 1 "$HANGUP_AGI_TARGET") == '#!/usr/bin/perl' ]] \
+    && perl -c "$HANGUP_AGI_TARGET" >/dev/null 2>&1; then
+    pass 'deployed hangup AGI is executable, valid Perl source'
+else
+    fail 'deployed hangup AGI is missing, non-executable, or invalid Perl source'
+fi
+
+if [[ -f "$HANGUP_AGI_SOURCE" && -f "$HANGUP_AGI_TARGET" ]] && cmp -s "$HANGUP_AGI_SOURCE" "$HANGUP_AGI_TARGET"; then
+    pass 'deployed hangup AGI matches workspace source'
+else
+    fail 'deployed hangup AGI differs from workspace source'
+fi
+
 if [[ -f "$PHP_SOURCE" ]] && php -l "$PHP_SOURCE" >/dev/null 2>&1; then
     pass 'source PHP syntax'
 else
@@ -185,6 +201,13 @@ if [[ -f "$AGI_TARGET" ]]; then
     [[ "$agi_identity" == 'asterisk:asterisk 750' ]] \
         && pass 'AGI ownership and mode are asterisk:asterisk 0750' \
         || fail "AGI ownership/mode expected asterisk:asterisk 750, got: ${agi_identity:-unknown}"
+fi
+
+if [[ -f "$HANGUP_AGI_TARGET" ]]; then
+    hangup_agi_identity=$(stat -c '%U:%G %a' "$HANGUP_AGI_TARGET" 2>/dev/null || true)
+    [[ "$hangup_agi_identity" == 'asterisk:asterisk 750' ]] \
+        && pass 'Hangup AGI ownership and mode are asterisk:asterisk 0750' \
+        || fail "Hangup AGI ownership/mode expected asterisk:asterisk 750, got: ${hangup_agi_identity:-unknown}"
 fi
 
 if [[ -f "$PHP_TARGET" ]]; then
@@ -272,6 +295,23 @@ if [[ -n "$MYSQL_DEFAULTS_FILE" ]] && mysql_db --batch --skip-column-names -e 'S
         && pass 'reputation cache schema supports provider status and errors' \
         || fail "expected 4 reputation cache columns, found ${reputation_column_count:-unknown}"
 
+    score_column_count=$(mysql_db --batch --skip-column-names -e \
+        "SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_NAME='did_optimizer_pool'
+            AND COLUMN_NAME IN ('sample_size','human_answered_calls','good_calls',
+              'answered_seconds_sum','performance_score');" 2>/dev/null)
+    [[ "$score_column_count" == '5' ]] \
+        && pass 'pool schema supports incremental performance scoring' \
+        || fail "expected 5 pool scoring columns, found ${score_column_count:-unknown}"
+
+    stats_applied_column_count=$(mysql_db --batch --skip-column-names -e \
+        "SELECT COUNT(*) FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_NAME='did_optimizer_assignments'
+            AND COLUMN_NAME='stats_applied';" 2>/dev/null)
+    [[ "$stats_applied_column_count" == '1' ]] \
+        && pass 'assignments schema supports the hangup-hook idempotency guard' \
+        || fail 'assignments.stats_applied column is missing'
+
     row_summary=$(mysql_db --batch --skip-column-names -e \
         "SELECT CONCAT('pool=', (SELECT COUNT(*) FROM did_optimizer_pool),
                        ' assignments=', (SELECT COUNT(*) FROM did_optimizer_assignments),
@@ -296,6 +336,12 @@ if command -v asterisk >/dev/null 2>&1; then
     else
         fail 'DID optimizer AGI line not found in the active dialplan'
     fi
+    if grep -Fq 'AGI(did_optimizer_hangup.agi' <<< "$dialplan_output"; then
+        active_hangup_dialplan_lines=$(grep -Fc 'AGI(did_optimizer_hangup.agi' <<< "$dialplan_output")
+        pass "DID optimizer hangup AGI appears in the active dialplan ($active_hangup_dialplan_lines route(s))"
+    else
+        warn 'DID optimizer hangup AGI line not found in the active dialplan - performance scores will never update'
+    fi
 else
     fail 'Asterisk CLI is unavailable; active dialplan was not checked'
 fi
@@ -310,6 +356,16 @@ if [[ -n "$persistent_dialplan_lines" ]]; then
     pass "DID optimizer AGI appears in persistent dialplan configuration ($persistent_dialplan_count route(s))"
 else
     fail 'DID optimizer AGI line not found in persistent /etc/asterisk/*.conf files'
+fi
+
+persistent_hangup_dialplan_lines=$(grep -RhsE --include='*.conf' \
+    '^[[:space:]]*(same|exten)[[:space:]]*=>.*AGI\(did_optimizer_hangup\.agi' \
+    /etc/asterisk 2>/dev/null || true)
+if [[ -n "$persistent_hangup_dialplan_lines" ]]; then
+    persistent_hangup_dialplan_count=$(grep -c . <<< "$persistent_hangup_dialplan_lines")
+    pass "DID optimizer hangup AGI appears in persistent dialplan configuration ($persistent_hangup_dialplan_count route(s))"
+else
+    warn 'DID optimizer hangup AGI line not found in persistent /etc/asterisk/*.conf files - performance scores will never update'
 fi
 
 printf '%s\n' '========================'
