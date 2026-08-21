@@ -175,10 +175,16 @@ header and a JSON body such as:
 
 The provider response must contain a `results` array. Each result can include
 `number`, `rk_reputation`, `rk_status`, and `error`. Results are shared through
-`did_optimizer_reputation_cache`. The AGI excludes DIDs with a fresh negative
-reputation result and uses a neutral reputation component when the provider is
-not configured or a DID has no current result. A DID whose lookup comes back
-negative also has its pool row disabled (`enabled='N'`).
+`did_optimizer_reputation_cache`, and a DID whose lookup comes back negative
+has its pool row disabled (`enabled='N'`) - that disable, not a live
+reputation join, is what excludes it from AGI selection (`did_optimizer.agi`
+no longer joins `did_optimizer_reputation_cache` at all; it trusts `enabled`).
+A DID an admin manually re-enables despite a still-negative cached reputation
+becomes selectable again immediately, rather than staying excluded until its
+cache entry changes. `did_optimizer_hangup.agi` still reads the cache
+directly (see **Call performance scoring**) for the reputation component
+folded into `performance_score`, and uses a neutral component when the
+provider is not configured or a DID has no current result.
 
 Every lookup call is split into fixed-size batches of 200 numbers (each with
 its own 10-second timeout) so one slow or failed batch does not block the

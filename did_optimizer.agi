@@ -250,20 +250,22 @@ sub validate_call_context {
 
 sub get_candidate_dids {
     my ($db, $campaign) = @_;
+    # No reputation join here: admin_did_optimizer_pool.php and
+    # reputation_cron.php already disable (enabled='N') any DID whose
+    # reputation comes back negative, so p.enabled alone reflects it. A DID
+    # an admin has manually re-enabled despite a still-negative cached
+    # reputation is now eligible again immediately, rather than staying
+    # excluded until its cache entry changes.
     my $sql = q{
         SELECT p.did_id, p.did_number, p.campaign_id, p.country_code,
                p.admin_priority, p.total_assignments,
                CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END AS effective_calls_today,
-               p.daily_limit, p.last_used, r.reputation,
+               p.daily_limit, p.last_used,
                p.sample_size, p.human_answered_calls, p.good_calls,
                p.answered_seconds_sum, p.performance_score
           FROM did_optimizer_pool p
-          LEFT JOIN did_optimizer_reputation_cache r
-            ON r.did_number = p.did_number
-           AND r.checked_at >= (NOW() - INTERVAL 15 MINUTE)
          WHERE p.campaign_id = ?
            AND p.enabled = 'Y'
-           AND (r.reputation IS NULL OR LOWER(r.reputation) <> 'negative')
            AND (p.daily_limit = 0 OR
                 CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END < p.daily_limit)
          ORDER BY p.did_id
@@ -456,7 +458,7 @@ sub select_and_record {
     for my $candidate (@$candidates) {
         agi_verbose(
             sprintf(
-                'candidate DID=%s npanxx=%s geo_rank=%d sample=%d human=%d good=%d avg_answered=%.1f reputation=%s score=%.4f',
+                'candidate DID=%s npanxx=%s geo_rank=%d sample=%d human=%d good=%d avg_answered=%.1f score=%.4f',
                 $candidate->{'did_number'}, $candidate->{'npanxx'} || 'NONE',
                 $candidate->{'geo_match_rank'} || 0,
                 $candidate->{'sample_size'} || 0,
@@ -464,7 +466,6 @@ sub select_and_record {
                 $candidate->{'good_calls'} || 0,
                 $candidate->{'human_answered_calls'}
                     ? $candidate->{'answered_seconds_sum'} / $candidate->{'human_answered_calls'} : 0,
-                $candidate->{'reputation'} || 'Unknown',
                 $candidate->{'performance_score'} || 0
             ),
             0
