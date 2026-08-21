@@ -155,7 +155,22 @@ The provider response must contain a `results` array. Each result can include
 `number`, `rk_reputation`, `rk_status`, and `error`. Results are shared through
 `did_optimizer_reputation_cache`. The AGI excludes DIDs with a fresh negative
 reputation result and uses a neutral reputation component when the provider is
-not configured or a DID has no current result.
+not configured or a DID has no current result. A DID whose lookup comes back
+negative also has its pool row disabled (`enabled='N'`).
+
+Every lookup call is split into fixed-size batches of 200 numbers (each with
+its own 10-second timeout) so one slow or failed batch does not block the
+rest of a large request.
+
+`reputation_cron.php`, installed alongside the admin page and registered in
+`/etc/cron.d/did-optimizer-reputation` on every dialer/web node, sweeps the
+entire `did_optimizer_pool` every 5 minutes so reputation stays current for
+DIDs that are never opened in the admin page - the admin page itself only
+ever checks the rows it renders (25 at a time, or the full filtered set on
+demand via **Recheck Reputation**), so without the cron sweep any DID never
+viewed would stay `Unknown` indefinitely. The cron run and the admin page
+share the same cache and TTL, so a DID checked by either one is skipped by
+the other until it goes stale again.
 
 ### Data safety
 
@@ -199,11 +214,12 @@ during `sudo ./install_did_optimizer.sh --role database`.
 sudo ./uninstall.sh --role dialer
 ```
 
-Removes the deployed AGI, the admin PHP page from every supported VICIdial web
-root, and the `/usr/local/share/did-optimizer/` maintenance copies. The shared
-database schema and dialplan are left unchanged; remove the optimizer line
-from the VICIdial carrier Dialplan Entry and rebuild/reload the dialplan
-separately.
+Removes the deployed AGI, the admin PHP page (and its reputation include and
+cron sweep) from every supported VICIdial web root, the
+`/etc/cron.d/did-optimizer-reputation` cron entry, and the
+`/usr/local/share/did-optimizer/` maintenance copies. The shared database
+schema and dialplan are left unchanged; remove the optimizer line from the
+VICIdial carrier Dialplan Entry and rebuild/reload the dialplan separately.
 
 ```bash
 sudo ./uninstall.sh --role database --purge-data

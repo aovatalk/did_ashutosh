@@ -7,10 +7,13 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SQL_SOURCE="$SCRIPT_DIR/did_optimizer.sql"
 AGI_SOURCE="$SCRIPT_DIR/did_optimizer.agi"
 PHP_SOURCE="$SCRIPT_DIR/admin_did_optimizer_pool.php"
+REPUTATION_INC_SOURCE="$SCRIPT_DIR/did_optimizer_reputation.inc.php"
+REPUTATION_CRON_SOURCE="$SCRIPT_DIR/reputation_cron.php"
 QUICK_TEST_SOURCE="$SCRIPT_DIR/quick-test.sh"
 DB_NAME="asterisk"
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
 MAINTENANCE_DIR="/usr/local/share/did-optimizer"
+REPUTATION_CRON_FILE="/etc/cron.d/did-optimizer-reputation"
 ROLE=""
 CLEAN_INSTALL=0
 SOURCE_BASE_URL="${DIDOPT_SOURCE_BASE_URL:-https://raw.githubusercontent.com/aovatalk/did_ashutosh/refs/heads/main}"
@@ -92,6 +95,8 @@ if [[ "$ROLE" == 'database' ]]; then
 else
     download_source_file did_optimizer.agi
     download_source_file admin_did_optimizer_pool.php
+    download_source_file did_optimizer_reputation.inc.php
+    download_source_file reputation_cron.php
     download_source_file quick-test.sh
 fi
 
@@ -223,8 +228,9 @@ install_dialer() {
     require_command awk
     require_command perl
     require_command grep
-    [[ -r "$AGI_SOURCE" && -r "$PHP_SOURCE" && -r "$QUICK_TEST_SOURCE" ]] \
-        || die 'AGI, PHP, or quick-test source is missing.'
+    [[ -r "$AGI_SOURCE" && -r "$PHP_SOURCE" && -r "$REPUTATION_INC_SOURCE" \
+       && -r "$REPUTATION_CRON_SOURCE" && -r "$QUICK_TEST_SOURCE" ]] \
+        || die 'AGI, PHP, reputation, or quick-test source is missing.'
     vicidial_path=$(find_vicidial_path) \
         || die 'VICIdial web installation not found in the supported web roots.'
     php_target="$vicidial_path/admin_did_optimizer_pool.php"
@@ -236,14 +242,28 @@ install_dialer() {
 
     perl -c "$AGI_SOURCE"
     php -l "$PHP_SOURCE"
+    php -l "$REPUTATION_INC_SOURCE"
+    php -l "$REPUTATION_CRON_SOURCE"
     install -o asterisk -g asterisk -m 0750 "$AGI_SOURCE" "$AGI_TARGET"
     install -o root -g root -m 0755 "$PHP_SOURCE" "$php_target"
+    # did_optimizer_reputation.inc.php and reputation_cron.php require()
+    # each other and dbconnect_mysqli.php via __DIR__, so both must live
+    # next to admin_did_optimizer_pool.php in the VICIdial web root.
+    install -o root -g root -m 0644 "$REPUTATION_INC_SOURCE" "$vicidial_path/did_optimizer_reputation.inc.php"
+    install -o root -g root -m 0750 "$REPUTATION_CRON_SOURCE" "$vicidial_path/reputation_cron.php"
     install -d -o root -g root -m 0755 "$MAINTENANCE_DIR"
     install -o root -g root -m 0644 "$AGI_SOURCE" "$MAINTENANCE_DIR/did_optimizer.agi"
     install -o root -g root -m 0644 "$PHP_SOURCE" "$MAINTENANCE_DIR/admin_did_optimizer_pool.php"
+    install -o root -g root -m 0644 "$REPUTATION_INC_SOURCE" "$MAINTENANCE_DIR/did_optimizer_reputation.inc.php"
+    install -o root -g root -m 0750 "$REPUTATION_CRON_SOURCE" "$MAINTENANCE_DIR/reputation_cron.php"
     install -o root -g root -m 0755 "$QUICK_TEST_SOURCE" "$MAINTENANCE_DIR/quick-test.sh"
     perl -c "$AGI_TARGET"
     php -l "$php_target"
+
+    printf '%s\n' "*/5 * * * * root php $vicidial_path/reputation_cron.php >> /var/log/did-optimizer-reputation.log 2>&1" \
+        > "$REPUTATION_CRON_FILE"
+    chmod 0644 "$REPUTATION_CRON_FILE"
+    printf 'Reputation sweep cron installed: %s (every 5 minutes)\n' "$REPUTATION_CRON_FILE"
 
     source_agi_hash=$(sha256sum "$AGI_SOURCE" | awk '{print $1}')
     target_agi_hash=$(sha256sum "$AGI_TARGET" | awk '{print $1}')

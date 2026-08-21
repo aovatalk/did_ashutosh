@@ -6,8 +6,13 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DB_NAME="asterisk"
 AGI_SOURCE="$SCRIPT_DIR/did_optimizer.agi"
 PHP_SOURCE="$SCRIPT_DIR/admin_did_optimizer_pool.php"
+REPUTATION_INC_SOURCE="$SCRIPT_DIR/did_optimizer_reputation.inc.php"
+REPUTATION_CRON_SOURCE="$SCRIPT_DIR/reputation_cron.php"
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
+REPUTATION_CRON_FILE="/etc/cron.d/did-optimizer-reputation"
 PHP_TARGET=""
+REPUTATION_INC_TARGET=""
+REPUTATION_CRON_TARGET=""
 MYSQL_DEFAULTS_FILE=""
 
 failures=0
@@ -70,10 +75,14 @@ printf '%s\n' 'DID optimizer quick test' '========================'
 
 if VICIDIAL_PATH=$(find_vicidial_path); then
     PHP_TARGET="$VICIDIAL_PATH/admin_did_optimizer_pool.php"
+    REPUTATION_INC_TARGET="$VICIDIAL_PATH/did_optimizer_reputation.inc.php"
+    REPUTATION_CRON_TARGET="$VICIDIAL_PATH/reputation_cron.php"
     pass "VICIdial web installation detected: $VICIDIAL_PATH"
 else
     fail 'VICIdial web installation not found in the supported web roots'
     PHP_TARGET='/__didopt_vicidial_not_found__/admin_did_optimizer_pool.php'
+    REPUTATION_INC_TARGET='/__didopt_vicidial_not_found__/did_optimizer_reputation.inc.php'
+    REPUTATION_CRON_TARGET='/__didopt_vicidial_not_found__/reputation_cron.php'
 fi
 
 for command_name in php mysql sha256sum stat grep cmp runuser perl awk mktemp; do
@@ -101,9 +110,28 @@ else
     fail '/etc/astguiclient.conf is not readable'
 fi
 
-for required_file in "$AGI_SOURCE" "$PHP_SOURCE" "$AGI_TARGET" "$PHP_TARGET"; do
+for required_file in "$AGI_SOURCE" "$PHP_SOURCE" "$AGI_TARGET" "$PHP_TARGET" \
+    "$REPUTATION_INC_SOURCE" "$REPUTATION_CRON_SOURCE" "$REPUTATION_INC_TARGET" "$REPUTATION_CRON_TARGET"; do
     check_file "$required_file"
 done
+
+if [[ -f "$REPUTATION_INC_TARGET" ]] && php -l "$REPUTATION_INC_TARGET" >/dev/null 2>&1; then
+    pass 'deployed reputation include syntax'
+else
+    fail 'deployed reputation include syntax'
+fi
+
+if [[ -f "$REPUTATION_CRON_TARGET" ]] && php -l "$REPUTATION_CRON_TARGET" >/dev/null 2>&1; then
+    pass 'deployed reputation cron syntax'
+else
+    fail 'deployed reputation cron syntax'
+fi
+
+if [[ -f "$REPUTATION_CRON_FILE" ]] && grep -Fq 'reputation_cron.php' "$REPUTATION_CRON_FILE"; then
+    pass "reputation sweep cron registered: $REPUTATION_CRON_FILE"
+else
+    fail "reputation sweep cron missing: $REPUTATION_CRON_FILE"
+fi
 
 if [[ -r "$AGI_SOURCE" ]] \
     && [[ $(head -n 1 "$AGI_SOURCE") == '#!/usr/bin/perl' ]] \

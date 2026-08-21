@@ -6,6 +6,7 @@ ROLE=""
 PURGE_DATA=0
 AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
 MAINTENANCE_DIR="/usr/local/share/did-optimizer"
+REPUTATION_CRON_FILE="/etc/cron.d/did-optimizer-reputation"
 DB_NAME="asterisk"
 
 die() {
@@ -73,11 +74,16 @@ remove_file "$AGI_TARGET"
 # root migration are removed as well.
 for web_root in /srv/www/htdocs /var/www/html /var/www; do
     remove_file "$web_root/vicidial/admin_did_optimizer_pool.php"
+    remove_file "$web_root/vicidial/did_optimizer_reputation.inc.php"
+    remove_file "$web_root/vicidial/reputation_cron.php"
 done
 
 remove_file "$MAINTENANCE_DIR/did_optimizer.agi"
 remove_file "$MAINTENANCE_DIR/admin_did_optimizer_pool.php"
+remove_file "$MAINTENANCE_DIR/did_optimizer_reputation.inc.php"
+remove_file "$MAINTENANCE_DIR/reputation_cron.php"
 remove_file "$MAINTENANCE_DIR/quick-test.sh"
+remove_file "$REPUTATION_CRON_FILE"
 
 if [[ -d "$MAINTENANCE_DIR" ]]; then
     if rmdir -- "$MAINTENANCE_DIR" 2>/dev/null; then
