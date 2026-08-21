@@ -111,7 +111,7 @@ else
 fi
 
 for required_file in "$AGI_SOURCE" "$PHP_SOURCE" "$AGI_TARGET" "$PHP_TARGET" \
-    "$REPUTATION_INC_SOURCE" "$REPUTATION_CRON_SOURCE" "$REPUTATION_INC_TARGET" "$REPUTATION_CRON_TARGET"; do
+    "$REPUTATION_INC_SOURCE" "$REPUTATION_INC_TARGET"; do
     check_file "$required_file"
 done
 
@@ -121,13 +121,20 @@ else
     fail 'deployed reputation include syntax'
 fi
 
-if [[ -f "$REPUTATION_CRON_TARGET" ]] && php -l "$REPUTATION_CRON_TARGET" >/dev/null 2>&1; then
+# The reputation sweep cron is optional (install_did_optimizer.sh --reputation
+# no). Its absence from the workspace, not just the deployed targets, is what
+# tells us it was deliberately skipped rather than a broken/partial install.
+if [[ ! -f "$REPUTATION_CRON_SOURCE" ]]; then
+    warn 'reputation sweep cron not installed (--reputation no was used, or this checkout predates it)'
+elif [[ -f "$REPUTATION_CRON_TARGET" ]] && php -l "$REPUTATION_CRON_TARGET" >/dev/null 2>&1; then
     pass 'deployed reputation cron syntax'
 else
     fail 'deployed reputation cron syntax'
 fi
 
-if [[ -f "$REPUTATION_CRON_FILE" ]] && grep -Fq 'reputation_cron.php' "$REPUTATION_CRON_FILE"; then
+if [[ ! -f "$REPUTATION_CRON_SOURCE" ]]; then
+    : # already warned above
+elif [[ -f "$REPUTATION_CRON_FILE" ]] && grep -Fq 'reputation_cron.php' "$REPUTATION_CRON_FILE"; then
     pass "reputation sweep cron registered: $REPUTATION_CRON_FILE"
 else
     fail "reputation sweep cron missing: $REPUTATION_CRON_FILE"

@@ -172,6 +172,12 @@ viewed would stay `Unknown` indefinitely. The cron run and the admin page
 share the same cache and TTL, so a DID checked by either one is skipped by
 the other until it goes stale again.
 
+Pass `--reputation no` to `install_did_optimizer.sh --role dialer` to skip
+deploying and registering the cron sweep on that node. The reputation cache
+and admin UI (including manual/bulk recheck) still work either way; only the
+automatic background sweep is skipped, so any DID not opened in the admin
+page stays `Unknown`.
+
 ### Data safety
 
 Normal installation creates missing tables and upgrades the original schema
