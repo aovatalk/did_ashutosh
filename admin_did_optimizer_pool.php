@@ -160,6 +160,8 @@ function diop_load_reputations($link, $numbers)
 				 VALUES (?, ?, ?, ?, NOW())
 				 ON DUPLICATE KEY UPDATE reputation=VALUES(reputation), lookup_status=VALUES(lookup_status),
 				                         lookup_error=VALUES(lookup_error), checked_at=NOW()");
+			$disable_stmt = mysqli_prepare($link,
+				"UPDATE did_optimizer_pool SET enabled='N' WHERE did_number=? AND enabled='Y'");
 			foreach ($payload['results'] as $item)
 				{
 				$digits = isset($item['number']) ? preg_replace('/\D/', '', $item['number']) : '';
@@ -169,10 +171,16 @@ function diop_load_reputations($link, $numbers)
 				$error = !empty($item['error']) ? substr((string)$item['error'], 0, 255) : null;
 				mysqli_stmt_bind_param($stmt, 'ssss', $digits, $reputation, $status, $error);
 				mysqli_stmt_execute($stmt);
+				if ($reputation !== null && strtolower($reputation) == 'negative')
+					{
+					mysqli_stmt_bind_param($disable_stmt, 's', $digits);
+					mysqli_stmt_execute($disable_stmt);
+					}
 				$results[$digits] = array('did_number'=>$digits, 'reputation'=>$reputation,
 					'lookup_status'=>$status, 'lookup_error'=>$error, 'checked_at'=>date('Y-m-d H:i:s'), 'is_fresh'=>1);
 				}
 			mysqli_stmt_close($stmt);
+			mysqli_stmt_close($disable_stmt);
 			}
 		elseif (!count($results))
 			{
