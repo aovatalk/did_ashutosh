@@ -257,9 +257,7 @@ sub get_candidate_dids {
     # reputation is now eligible again immediately, rather than staying
     # excluded until its cache entry changes.
     my $sql = q{
-        SELECT p.did_id, p.did_number, p.campaign_id, p.country_code,
-               p.admin_priority, p.total_assignments,
-               CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END AS effective_calls_today,
+        SELECT p.did_id, p.did_number, p.campaign_id,
                p.daily_limit, p.last_used,
                p.sample_size, p.human_answered_calls, p.good_calls,
                p.answered_seconds_sum, p.performance_score
