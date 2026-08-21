@@ -13,8 +13,8 @@ AGI_TARGET="/var/lib/asterisk/agi-bin/did_optimizer.agi"
 MAINTENANCE_DIR="/usr/local/share/did-optimizer"
 ROLE=""
 CLEAN_INSTALL=0
-SOURCE_BASE_URL="${DIDOPT_SOURCE_BASE_URL:-https://raw.githubusercontent.com/aovatalk/did-optimizer-cluster/refs/heads/main}"
-GEO_DATASET_URL="${DIDOPT_GEO_DATASET_URL:-https://raw.githubusercontent.com/aovatalk/did-optimizer/refs/heads/main/NPA_dataset.zip}"
+SOURCE_BASE_URL="${DIDOPT_SOURCE_BASE_URL:-https://raw.githubusercontent.com/aovatalk/did_ashutosh/refs/heads/main}"
+GEO_DATASET_URL="${DIDOPT_GEO_DATASET_URL:-https://raw.githubusercontent.com/aovatalk/did_ashutosh/refs/heads/main/NPA_dataset.zip}"
 GEO_ZIP_SOURCE="$SCRIPT_DIR/NPA_dataset.zip"
 
 die() {
