@@ -1,0 +1,984 @@
+#!/usr/bin/perl
+
+# VICIdial DID Optimizer
+# Runtime dependencies: Perl, DBI, DBD::mysql, Asterisk AGI, VICIdial database.
+
+use strict;
+use warnings;
+use DBI;
+
+$| = 1;
+
+my $SCRIPT_NAME          = 'did_optimizer.agi';
+my $CONFIG_FILE         = '/etc/astguiclient.conf';
+my $DEBUG               = exists $ENV{'DIDOPT_DEBUG'} ? ($ENV{'DIDOPT_DEBUG'} ? 1 : 0) : 0;
+my $MAX_CANDIDATES      = 100;
+my $MAX_SAMPLE_SIZE     = 20;
+my $MIN_SUCCESS_DURATION = 5; # A successful call must be strictly greater than this.
+my $BAYES_PRIOR_STRENGTH = 5;
+my $DURATION_SCORE_CAP   = 30; # Durations at or above this many seconds receive full credit.
+my $HIGH_PERFORMER_BAND  = 0.05; # Scores within five points of the best are treated as similar.
+my $GOOD_RATE_WEIGHT     = 0.40;
+my $HUMAN_RATE_WEIGHT    = 0.24;
+my $DURATION_WEIGHT      = 0.16;
+my $REPUTATION_WEIGHT    = 0.20;
+
+my $dbh;
+my $agi_ready = 0;
+
+sub read_agi_environment {
+    my %agi;
+    while (defined(my $line = <STDIN>)) {
+        $line =~ s/[\r\n]+$//;
+        last if $line eq '';
+        if ($line =~ /^agi_([^:]+):\s*(.*)$/) {
+            $agi{$1} = $2;
+        }
+    }
+    $agi_ready = 1;
+    return \%agi;
+}
+
+sub agi_quote {
+    my ($value) = @_;
+    $value = '' unless defined $value;
+    $value =~ s/[\r\n\x00-\x1f]+/ /g;
+    $value =~ s/\\/\\\\/g;
+    $value =~ s/"/\\"/g;
+    return qq{"$value"};
+}
+
+sub agi_command {
+    my ($command) = @_;
+    return (undef, 'AGI environment not available') unless $agi_ready;
+
+    print STDOUT $command . "\n";
+    my $response = <STDIN>;
+    return (undef, 'No response from Asterisk') unless defined $response;
+    $response =~ s/[\r\n]+$//;
+
+    if ($response =~ /^200\s+result=(-?\d+)/) {
+        return ($1 + 0, $response);
+    }
+    return (undef, $response);
+}
+
+sub agi_verbose {
+    my ($message, $always) = @_;
+    return unless $always || $DEBUG;
+    $message = 'DIDOPT: ' . ($message // '');
+    agi_command('VERBOSE ' . agi_quote($message) . ' 1');
+}
+
+sub agi_set_variable {
+    my ($name, $value) = @_;
+    return 0 unless defined $name && $name =~ /^[A-Za-z0-9_()]+$/;
+    my ($result) = agi_command('SET VARIABLE ' . $name . ' ' . agi_quote($value));
+    return defined($result) && $result >= 0;
+}
+
+sub set_callerid {
+    my ($did) = @_;
+    return 0 unless defined $did && $did =~ /^\d{7,32}$/;
+    # Set only CALLERID(num); do not overwrite CALLERID(name).
+    my ($result) = agi_command('EXEC Set CALLERID(num)=' . $did);
+    return defined($result) && $result >= 0;
+}
+
+sub set_failure_status {
+    my ($status, $reason) = @_;
+    agi_set_variable('DIDOPT_STATUS', $status);
+    agi_set_variable('DIDOPT_REASON', $reason);
+    agi_verbose("status=$status reason=$reason", 1);
+}
+
+sub abort_request {
+    my ($status, $message) = @_;
+    $message =~ s/[\r\n|]+/ /g;
+    die "DIDOPT_ABORT|$status|$message\n";
+}
+
+sub load_vicidial_config {
+    my ($path) = @_;
+    open(my $fh, '<', $path) or die "Cannot open $path: $!";
+
+    my %config;
+    while (my $line = <$fh>) {
+        $line =~ s/[\r\n]+$//;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '' || $line =~ /^\s*[#;]/;
+        next unless $line =~ /^([A-Za-z0-9_]+)\s*=>?\s*(.*?)\s*$/;
+        $config{$1} = $2;
+    }
+    close($fh);
+
+    for my $required (qw(VARDB_server VARDB_database VARDB_user VARDB_pass)) {
+        die "Missing $required in $path" unless defined $config{$required} && $config{$required} ne '';
+    }
+    $config{'VARDB_port'} = 3306 unless $config{'VARDB_port'};
+    die 'Invalid VARDB_port' unless $config{'VARDB_port'} =~ /^\d{1,5}$/;
+    return \%config;
+}
+
+sub connect_database {
+    my ($config) = @_;
+    my $dsn = 'DBI:mysql:database=' . $config->{'VARDB_database'}
+            . ';host=' . $config->{'VARDB_server'}
+            . ';port=' . $config->{'VARDB_port'};
+
+    my $dbh = DBI->connect(
+        $dsn,
+        $config->{'VARDB_user'},
+        $config->{'VARDB_pass'},
+        {
+            RaiseError           => 1,
+            PrintError           => 0,
+            AutoCommit           => 1,
+            mysql_auto_reconnect => 0,
+        }
+    );
+    # Align the connection collation with the existing VICIdial schema
+    # (utf8_unicode_ci) so comparisons/joins against vicidial_* tables do not
+    # raise "Illegal mix of collations".
+    $dbh->do('SET NAMES utf8 COLLATE utf8_unicode_ci') if $dbh;
+    return $dbh;
+}
+
+sub clean_argument {
+    my ($value) = @_;
+    return '' unless defined $value;
+    $value =~ s/^\s+|\s+$//g;
+    return '' if $value =~ /^(?:NULL|NONE|UNDEFINED)$/i;
+    return $value;
+}
+
+sub normalize_number {
+    my ($number) = @_;
+    return '' unless defined $number;
+    $number =~ s/\D//g;
+
+    # Initial implementation is intentionally NANP-focused.
+    if (length($number) == 10 && $number =~ /^[2-9]/) {
+        return '1' . $number;
+    }
+    if (length($number) == 11 && $number =~ /^1[2-9]/) {
+        return $number;
+    }
+    return $number;
+}
+
+sub get_npanxx {
+    my ($number) = @_;
+    my $normalized = normalize_number($number);
+    return $1 if $normalized =~ /^1([2-9]\d{2}[2-9]\d{2})\d{4}$/;
+    return '';
+}
+
+# VICIdial-version-specific live-call mapping is isolated here.
+# This repository maps outbound calls through vicidial_auto_calls.
+sub find_current_call {
+    my ($db, $agi, $args, $local_server_ip) = @_;
+
+    my $arg_campaign = clean_argument($args->[0]);
+    my $arg_destination = clean_argument($args->[1]);
+    my $arg_uniqueid = clean_argument($args->[2]);
+    my $arg_lead_id = clean_argument($args->[3]);
+
+    my $agi_uniqueid = clean_argument($agi->{'uniqueid'});
+    my $agi_channel = clean_argument($agi->{'channel'});
+    my $agi_callerid = clean_argument($agi->{'callerid'});
+    my $agi_calleridname = clean_argument($agi->{'calleridname'});
+    my $lookup_uniqueid = $arg_uniqueid || $agi_uniqueid;
+    my $row;
+
+    my $columns = q{
+        SELECT auto_call_id, server_ip, campaign_id, lead_id, uniqueid, callerid,
+               phone_code, phone_number, channel, call_type
+          FROM vicidial_auto_calls
+    };
+
+    if ($lookup_uniqueid ne '') {
+        $row = $db->selectrow_hashref(
+            $columns . q{ WHERE uniqueid = ? AND server_ip = ? AND call_type IN ('OUT','OUTBALANCE')
+                          ORDER BY auto_call_id DESC LIMIT 1},
+            undef, $lookup_uniqueid, $local_server_ip
+        );
+    }
+    if (!$row && $agi_channel ne '') {
+        $row = $db->selectrow_hashref(
+            $columns . q{ WHERE channel = ? AND server_ip = ? AND call_type IN ('OUT','OUTBALANCE')
+                          ORDER BY auto_call_id DESC LIMIT 1},
+            undef, $agi_channel, $local_server_ip
+        );
+    }
+    if (!$row && ($agi_callerid ne '' || $agi_calleridname ne '')) {
+        $row = $db->selectrow_hashref(
+            $columns . q{ WHERE (callerid = ? OR callerid = ?) AND server_ip = ?
+                          AND call_type IN ('OUT','OUTBALANCE')
+                          ORDER BY auto_call_id DESC LIMIT 1},
+            undef, $agi_callerid, $agi_calleridname, $local_server_ip
+        );
+    }
+
+    $row ||= {};
+    my $campaign = $arg_campaign || clean_argument($row->{'campaign_id'});
+    my $destination = $arg_destination;
+    if ($destination eq '') {
+        $destination = clean_argument($row->{'phone_code'})
+                     . clean_argument($row->{'phone_number'});
+    }
+    my $call_id = clean_argument($row->{'uniqueid'}) || $lookup_uniqueid;
+    my $lead_id = ($arg_lead_id =~ /^\d+$/) ? $arg_lead_id : ($row->{'lead_id'} || undef);
+
+    return {
+        campaign_id   => $campaign,
+        server_ip     => clean_argument($row->{'server_ip'}) || $local_server_ip,
+        destination   => normalize_number($destination),
+        unique_call_id => $call_id,
+        lead_id       => $lead_id,
+        auto_call_id  => $row->{'auto_call_id'},
+        lookup_source => keys(%$row) ? 'vicidial_auto_calls' : 'dialplan_arguments',
+    };
+}
+
+sub validate_call_context {
+    my ($call) = @_;
+    abort_request('NO_CAMPAIGN', 'Current outbound campaign could not be determined')
+        unless $call->{'campaign_id'};
+    abort_request('NO_CAMPAIGN', 'Campaign identifier contains unsupported characters')
+        unless $call->{'campaign_id'} =~ /^[A-Za-z0-9_-]{1,20}$/;
+    abort_request('NO_SERVER', 'Local VICIdial server identity could not be determined')
+        unless $call->{'server_ip'} && length($call->{'server_ip'}) <= 45;
+    abort_request('NO_DESTINATION', 'Outbound destination could not be determined')
+        unless $call->{'destination'} && $call->{'destination'} =~ /^\d{7,32}$/;
+    abort_request('NO_CALL', 'A correlation uniqueid could not be determined')
+        unless $call->{'unique_call_id'};
+    abort_request('NO_CALL', 'Correlation uniqueid is too long or contains control characters')
+        if length($call->{'unique_call_id'}) > 64 || $call->{'unique_call_id'} =~ /[\x00-\x1f]/;
+}
+
+sub get_candidate_dids {
+    my ($db, $campaign, $local_keys, $limit, $did_ids) = @_;
+    my $sql = q{
+        SELECT p.did_id, p.did_number, p.campaign_id, p.country_code,
+               p.admin_priority, p.total_assignments,
+               CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END AS effective_calls_today,
+               p.daily_limit, p.last_used, r.reputation
+          FROM did_optimizer_pool p
+          LEFT JOIN did_optimizer_reputation_cache r
+            ON r.did_number = p.did_number
+           AND r.checked_at >= (NOW() - INTERVAL 15 MINUTE)
+         WHERE p.campaign_id = ?
+           AND p.enabled = 'Y'
+           AND (r.reputation IS NULL OR LOWER(r.reputation) <> 'negative')
+           AND (p.daily_limit = 0 OR
+                CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END < p.daily_limit)
+    };
+    my @bind = ($campaign);
+    if ($local_keys && @$local_keys) {
+        my $placeholders = join(',', ('?') x scalar(@$local_keys));
+        $sql .= " AND p.local_key IN ($placeholders)";
+        push @bind, @$local_keys;
+    }
+    if ($did_ids && @$did_ids) {
+        my $placeholders = join(',', ('?') x scalar(@$did_ids));
+        $sql .= " AND p.did_id IN ($placeholders)";
+        push @bind, @$did_ids;
+    }
+    $sql .= q{
+         ORDER BY (p.last_used IS NOT NULL), p.last_used, p.did_id
+    };
+    $sql .= ' LIMIT ' . int($limit) if $limit;
+    my $rows = $db->selectall_arrayref($sql, { Slice => {} }, @bind);
+
+    my @valid;
+    for my $did (@$rows) {
+        $did->{'did_number'} = normalize_number($did->{'did_number'});
+        next unless $did->{'did_number'} =~ /^\d{7,32}$/;
+        $did->{'npanxx'} = get_npanxx($did->{'did_number'});
+        push @valid, $did;
+    }
+    return \@valid;
+}
+
+sub get_nearest_local_keys {
+    my ($db, $campaign, $destination_npanxx, $destination_local_key) = @_;
+    return [] unless $destination_npanxx;
+
+    my ($latitude, $longitude) = $db->selectrow_array(
+        q{SELECT AVG(latitude), AVG(longitude)
+            FROM did_optimizer_geo_prefixes
+           WHERE npanxx = ?
+             AND latitude IS NOT NULL
+             AND longitude IS NOT NULL},
+        undef, $destination_npanxx
+    );
+    return [] unless defined $latitude && defined $longitude;
+
+    # Rank only pools containing at least one currently acceptable DID. NPA
+    # centroids avoid the arbitrary result produced by using the first geo row
+    # for a large or geographically irregular area code.
+    my $rows = $db->selectall_arrayref(
+        q{SELECT pool_keys.local_key
+            FROM (
+                  SELECT DISTINCT p.local_key
+                    FROM did_optimizer_pool p
+                    LEFT JOIN did_optimizer_reputation_cache r
+                      ON r.did_number = p.did_number
+                     AND r.checked_at >= (NOW() - INTERVAL 15 MINUTE)
+                   WHERE p.campaign_id = ?
+                     AND p.enabled = 'Y'
+                     AND p.local_key <> ''
+                     AND p.local_key <> ?
+                     AND (r.reputation IS NULL OR LOWER(r.reputation) <> 'negative')
+                     AND (p.daily_limit = 0 OR
+                          CASE WHEN p.usage_date = CURDATE() THEN p.calls_today ELSE 0 END < p.daily_limit)
+                 ) pool_keys
+            JOIN did_optimizer_geo_npa_centroids centroids
+              ON centroids.npa = pool_keys.local_key
+           ORDER BY POW(centroids.latitude - ?, 2)
+                  + POW((centroids.longitude - ?) * COS(RADIANS(?)), 2),
+                    pool_keys.local_key
+           LIMIT 3},
+        { Slice => {} },
+        $campaign, $destination_local_key, $latitude, $longitude, $latitude
+    );
+    return [map { $_->{'local_key'} } @$rows];
+}
+
+sub get_preferred_candidate_dids {
+    my ($db, $campaign, $destination_npanxx, $local_key) = @_;
+    if (defined $local_key && $local_key ne '') {
+        my $local = get_candidate_dids($db, $campaign, [$local_key], 0);
+        return $local if @$local;
+
+        my $nearest_keys = get_nearest_local_keys(
+            $db, $campaign, $destination_npanxx, $local_key
+        );
+        if (@$nearest_keys) {
+            my $nearest = get_candidate_dids($db, $campaign, $nearest_keys, 0);
+            return $nearest if @$nearest;
+        }
+    }
+    # Last-resort campaign fallback remains bounded for destinations without
+    # coordinates or when all three nearby pools are ineligible.
+    return get_candidate_dids($db, $campaign, [], $MAX_CANDIDATES);
+}
+
+sub get_geo_profiles {
+    my ($db, $numbers) = @_;
+    my %prefixes = map { my $p = get_npanxx($_); $p ? ($p => 1) : () } @$numbers;
+    my %npas = map { substr($_, 0, 3) => 1 } keys %prefixes;
+    my %profiles;
+    return \%profiles unless keys %prefixes;
+
+    for my $prefix (keys %prefixes) {
+        $profiles{$prefix} = {
+            npanxx => $prefix, npa => substr($prefix, 0, 3),
+            cities => {}, states => {}, countries => {},
+        };
+    }
+
+    my @prefix_list = sort keys %prefixes;
+    my $placeholders = join(',', ('?') x scalar(@prefix_list));
+    my $rows = $db->selectall_arrayref(
+        qq{SELECT npanxx, npa, LOWER(city) AS city, state_iso, country_iso
+             FROM did_optimizer_geo_prefixes
+            WHERE npanxx IN ($placeholders)},
+        { Slice => {} }, @prefix_list
+    );
+    for my $row (@$rows) {
+        my $profile = $profiles{$row->{'npanxx'}};
+        my $country = uc($row->{'country_iso'} || '');
+        my $state = uc($row->{'state_iso'} || '');
+        my $city = lc($row->{'city'} || '');
+        $profile->{'countries'}->{$country} = 1 if $country ne '';
+        $profile->{'states'}->{"$country|$state"} = 1 if $state ne '';
+        $profile->{'cities'}->{"$country|$state|$city"} = 1 if $city ne '';
+    }
+
+    # The source snapshot may not contain recently assigned exchanges. Enrich
+    # every prefix with its NPA's state/country footprint so those numbers can
+    # still participate in same-area-code and same-state matching.
+    my @npa_list = sort keys %npas;
+    my $npa_placeholders = join(',', ('?') x scalar(@npa_list));
+    my $npa_rows = $db->selectall_arrayref(
+        qq{SELECT DISTINCT npa, state_iso, country_iso
+             FROM did_optimizer_geo_prefixes
+            WHERE npa IN ($npa_placeholders)},
+        { Slice => {} }, @npa_list
+    );
+    my %npa_geo;
+    for my $row (@$npa_rows) {
+        my $country = uc($row->{'country_iso'} || '');
+        my $state = uc($row->{'state_iso'} || '');
+        $npa_geo{$row->{'npa'}}->{'countries'}->{$country} = 1 if $country ne '';
+        $npa_geo{$row->{'npa'}}->{'states'}->{"$country|$state"} = 1 if $state ne '';
+    }
+    # VICIdial ships an area-code geography table. It supplies a cluster-safe
+    # baseline when the optional NPA-NXX enrichment table has not been loaded.
+    my $vicidial_npa_rows = $db->selectall_arrayref(
+        qq{SELECT CAST(areacode AS CHAR) AS npa,
+                  UPPER(COALESCE(state, '')) AS state_iso,
+                  UPPER(COALESCE(country, '')) AS country_iso
+             FROM vicidial_phone_codes
+            WHERE areacode IN ($npa_placeholders)},
+        { Slice => {} }, @npa_list
+    );
+    for my $row (@$vicidial_npa_rows) {
+        my $country = uc($row->{'country_iso'} || '');
+        my $state = uc($row->{'state_iso'} || '');
+        $npa_geo{$row->{'npa'}}->{'countries'}->{$country} = 1 if $country ne '';
+        $npa_geo{$row->{'npa'}}->{'states'}->{"$country|$state"} = 1 if $state ne '';
+    }
+    for my $profile (values %profiles) {
+        my $fallback = $npa_geo{$profile->{'npa'}} || {};
+        @{$profile->{'countries'}}{keys %{$fallback->{'countries'} || {}}} = (1) x scalar(keys %{$fallback->{'countries'} || {}});
+        @{$profile->{'states'}}{keys %{$fallback->{'states'} || {}}} = (1) x scalar(keys %{$fallback->{'states'} || {}});
+    }
+    return \%profiles;
+}
+
+sub geo_match_rank {
+    my ($destination, $candidate) = @_;
+    return 0 unless $destination && $candidate;
+    return 4 if $destination->{'npanxx'} eq $candidate->{'npanxx'};
+    for my $key (keys %{$candidate->{'cities'}}) {
+        return 3 if $destination->{'cities'}->{$key};
+    }
+    if (($destination->{'npa'} || '') ne '' && $destination->{'npa'} eq ($candidate->{'npa'} || '')) {
+        for my $country (keys %{$candidate->{'countries'}}) {
+            return 2 if $destination->{'countries'}->{$country};
+        }
+    }
+    for my $key (keys %{$candidate->{'states'}}) {
+        return 1 if $destination->{'states'}->{$key};
+    }
+    return 0;
+}
+
+sub get_best_geo_pool {
+    my ($candidates, $destination_profile, $geo_profiles) = @_;
+    my $best_rank = 0;
+    for my $candidate (@$candidates) {
+        my $rank = geo_match_rank($destination_profile, $geo_profiles->{$candidate->{'npanxx'}});
+        $candidate->{'geo_match_rank'} = $rank;
+        $best_rank = $rank if $rank > $best_rank;
+    }
+    my @pool = $best_rank
+        ? grep { ($_->{'geo_match_rank'} || 0) == $best_rank } @$candidates
+        : @$candidates;
+    return (\@pool, $best_rank);
+}
+
+sub database_supports_window_functions {
+    my ($db) = @_;
+    my ($version) = $db->selectrow_array('SELECT VERSION()');
+    $version ||= '';
+    if ($version =~ /MariaDB/i) {
+        return ($version =~ /^(\d+)\.(\d+)/ && ($1 > 10 || ($1 == 10 && $2 >= 2))) ? 1 : 0;
+    }
+    return ($version =~ /^(\d+)\.(\d+)/ && $1 >= 8) ? 1 : 0;
+}
+
+# VICIdial-version-specific completed-call mapping is isolated here.
+# unique_call_id -> vicidial_log.uniqueid
+# result status  -> vicidial_log.status
+# duration       -> vicidial_log.length_in_sec
+# human answer   -> campaign status override, then global status definition
+sub get_completed_call_results {
+    my ($db, $campaign, $dids) = @_;
+    my %stats;
+    for my $did (@$dids) {
+        $stats{$did} = {
+            sample_size              => 0,
+            human_answered_calls     => 0,
+            good_calls               => 0,
+            human_answer_rate        => 0,
+            good_call_rate           => 0,
+            average_answered_duration => 0,
+        };
+    }
+    return \%stats unless @$dids;
+
+    my $placeholders = join(',', ('?') x scalar(@$dids));
+    my $human_sql = q{
+        COALESCE(
+            (SELECT vcs.human_answered
+               FROM vicidial_campaign_statuses vcs
+              WHERE vcs.campaign_id = a.campaign_id
+                AND vcs.status = v.status
+              LIMIT 1),
+            (SELECT vs.human_answered
+               FROM vicidial_statuses vs
+              WHERE vs.status = v.status
+              LIMIT 1),
+            'N'
+        )
+    };
+
+    my ($sql, @bind);
+    if (database_supports_window_functions($db)) {
+        $sql = qq{
+            SELECT did_number,
+                   COUNT(*) AS sample_size,
+                   SUM(CASE WHEN human_answered = 'Y' THEN 1 ELSE 0 END) AS human_answered_calls,
+                   SUM(CASE WHEN human_answered = 'Y' AND length_in_sec > ? THEN 1 ELSE 0 END) AS good_calls,
+                   AVG(CASE WHEN human_answered = 'Y' THEN length_in_sec ELSE NULL END) AS average_answered_duration
+              FROM (
+                    SELECT completed.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY did_number
+                               ORDER BY call_date DESC, assignment_id DESC
+                           ) AS sample_rank
+                      FROM (
+                            SELECT a.assignment_id, a.did_number, v.call_date,
+                                   COALESCE(v.length_in_sec, 0) AS length_in_sec,
+                                   $human_sql AS human_answered
+                              FROM did_optimizer_assignments a
+                              JOIN vicidial_log v
+                                ON v.uniqueid = a.unique_call_id
+                               AND v.campaign_id = a.campaign_id
+                             WHERE a.campaign_id = ?
+                               AND a.callerid_applied = 'Y'
+                               AND a.did_number IN ($placeholders)
+                           ) completed
+                   ) ranked
+             WHERE sample_rank <= ?
+             GROUP BY did_number
+        };
+        @bind = ($MIN_SUCCESS_DURATION, $campaign, @$dids, $MAX_SAMPLE_SIZE);
+    }
+    else {
+        # Compatible path for older MySQL/MariaDB versions without ROW_NUMBER().
+        # MySQL/MariaDB explicitly document that the evaluation order of
+        # user-variable assignments within a single SELECT list is undefined,
+        # so a session-variable ranking hack is not relied upon here. Instead,
+        # each candidate DID gets its own indexed "ORDER BY ... LIMIT" branch
+        # (using idx_didopt_assignment_did_recent), and the branches are
+        # combined with UNION ALL into a single round trip. This is both
+        # correct (no evaluation-order dependency) and bounded (each branch
+        # stops at MAX_SAMPLE_SIZE via an index range scan, regardless of how
+        # much history a DID accumulates over time).
+        my @branches;
+        @bind = ($MIN_SUCCESS_DURATION);
+        for my $did (@$dids) {
+            push @branches, qq{
+                (SELECT a.did_number,
+                        COALESCE(v.length_in_sec, 0) AS length_in_sec,
+                        $human_sql AS human_answered
+                   FROM did_optimizer_assignments a
+                   JOIN vicidial_log v
+                     ON v.uniqueid = a.unique_call_id
+                    AND v.campaign_id = a.campaign_id
+                  WHERE a.campaign_id = ?
+                    AND a.callerid_applied = 'Y'
+                    AND a.did_number = ?
+                  ORDER BY v.call_date DESC, a.assignment_id DESC
+                  LIMIT ?)
+            };
+            push @bind, $campaign, $did, $MAX_SAMPLE_SIZE;
+        }
+        $sql = qq{
+            SELECT did_number,
+                   COUNT(*) AS sample_size,
+                   SUM(CASE WHEN human_answered = 'Y' THEN 1 ELSE 0 END) AS human_answered_calls,
+                   SUM(CASE WHEN human_answered = 'Y' AND length_in_sec > ? THEN 1 ELSE 0 END) AS good_calls,
+                   AVG(CASE WHEN human_answered = 'Y' THEN length_in_sec ELSE NULL END) AS average_answered_duration
+              FROM ( } . join(' UNION ALL ', @branches) . qq{ ) ranked
+             GROUP BY did_number
+        };
+    }
+
+    my $rows = $db->selectall_arrayref($sql, { Slice => {} }, @bind);
+    for my $row (@$rows) {
+        my $sample = $row->{'sample_size'} || 0;
+        my $human = $row->{'human_answered_calls'} || 0;
+        my $good = $row->{'good_calls'} || 0;
+        $stats{$row->{'did_number'}} = {
+            sample_size               => $sample + 0,
+            human_answered_calls      => $human + 0,
+            good_calls                => $good + 0,
+            human_answer_rate         => $sample ? $human / $sample : 0,
+            good_call_rate            => $sample ? $good / $sample : 0,
+            average_answered_duration => ($row->{'average_answered_duration'} || 0) + 0,
+        };
+    }
+    return \%stats;
+}
+
+sub is_human_answered {
+    my ($db, $campaign, $status) = @_;
+    my ($answer) = $db->selectrow_array(
+        q{SELECT COALESCE(
+              (SELECT human_answered FROM vicidial_campaign_statuses
+                WHERE campaign_id = ? AND status = ? LIMIT 1),
+              (SELECT human_answered FROM vicidial_statuses
+                WHERE status = ? LIMIT 1), 'N')},
+        undef, $campaign, $status, $status
+    );
+    return ($answer || 'N') eq 'Y';
+}
+
+sub calculate_performance_scores {
+    my ($candidates, $stats) = @_;
+
+    my ($total_sample, $total_human, $total_good, $total_answered_seconds) = (0, 0, 0, 0);
+    for my $candidate (@$candidates) {
+        my $metric = $stats->{$candidate->{'did_number'}} ||= {
+            sample_size => 0, human_answered_calls => 0, good_calls => 0,
+            human_answer_rate => 0, good_call_rate => 0,
+            average_answered_duration => 0,
+        };
+        $total_sample += $metric->{'sample_size'} || 0;
+        $total_human += $metric->{'human_answered_calls'} || 0;
+        $total_good += $metric->{'good_calls'} || 0;
+        $total_answered_seconds += ($metric->{'average_answered_duration'} || 0)
+                                 * ($metric->{'human_answered_calls'} || 0);
+    }
+
+    # Empirical pool priors let mature campaign data define the baseline. The
+    # neutral fallbacks apply only while the campaign has no completed history.
+    my $prior_good_rate = $total_sample ? $total_good / $total_sample : 0.50;
+    my $prior_human_rate = $total_sample ? $total_human / $total_sample : 0.50;
+    my $prior_duration = $total_human ? $total_answered_seconds / $total_human : 30;
+
+    for my $candidate (@$candidates) {
+        my $metric = $stats->{$candidate->{'did_number'}};
+        my $sample = $metric->{'sample_size'} || 0;
+        my $human = $metric->{'human_answered_calls'} || 0;
+        my $good = $metric->{'good_calls'} || 0;
+        my $answered_seconds = ($metric->{'average_answered_duration'} || 0) * $human;
+
+        my $smoothed_good = ($good + $BAYES_PRIOR_STRENGTH * $prior_good_rate)
+                          / ($sample + $BAYES_PRIOR_STRENGTH);
+        my $smoothed_human = ($human + $BAYES_PRIOR_STRENGTH * $prior_human_rate)
+                           / ($sample + $BAYES_PRIOR_STRENGTH);
+        my $smoothed_duration = ($answered_seconds + $BAYES_PRIOR_STRENGTH * $prior_duration)
+                              / ($human + $BAYES_PRIOR_STRENGTH);
+        my $duration_component = $smoothed_duration / $DURATION_SCORE_CAP;
+        $duration_component = 1 if $duration_component > 1;
+        my $reputation = lc($candidate->{'reputation'} || '');
+        my $reputation_component = $reputation eq 'positive' ? 1
+                                 : $reputation eq 'negative' ? 0
+                                 : 0.50;
+
+        $metric->{'smoothed_good_call_rate'} = $smoothed_good;
+        $metric->{'smoothed_human_answer_rate'} = $smoothed_human;
+        $metric->{'smoothed_average_duration'} = $smoothed_duration;
+        $metric->{'reputation_component'} = $reputation_component;
+        $metric->{'reputation'} = $candidate->{'reputation'} || 'Unknown';
+        $metric->{'performance_score'} =
+              $GOOD_RATE_WEIGHT * $smoothed_good
+            + $HUMAN_RATE_WEIGHT * $smoothed_human
+            + $DURATION_WEIGHT * $duration_component
+            + $REPUTATION_WEIGHT * $reputation_component;
+    }
+}
+
+sub choose_candidate {
+    my ($candidates, $stats, $previous_did, $destination_profile, $geo_profiles) = @_;
+
+    my ($geo_pool, $best_geo_rank) = get_best_geo_pool(
+        $candidates, $destination_profile, $geo_profiles
+    );
+    my @pool = @$geo_pool;
+    my $used_local_pool = $best_geo_rank ? 1 : 0;
+
+    my $previous_excluded = 0;
+    if ($previous_did) {
+        my @without_previous = grep { $_->{'did_number'} ne $previous_did } @pool;
+        if (@without_previous) {
+            @pool = @without_previous;
+            $previous_excluded = 1;
+        }
+    }
+    return unless @pool;
+
+    calculate_performance_scores(\@pool, $stats);
+    my $best_score = 0;
+    for my $candidate (@pool) {
+        my $score = $stats->{$candidate->{'did_number'}}->{'performance_score'} || 0;
+        $best_score = $score if $score > $best_score;
+    }
+
+    # Keep only candidates whose Bayesian composite score is effectively near
+    # the leader, then spread traffic within that quality tier using LRU.
+    my @high_performers = grep {
+        ($stats->{$_->{'did_number'}}->{'performance_score'} || 0)
+            >= $best_score - $HIGH_PERFORMER_BAND
+    } @pool;
+    @high_performers = sort {
+        (($a->{'last_used'} || '0000-00-00 00:00:00')
+            cmp ($b->{'last_used'} || '0000-00-00 00:00:00'))
+        || $stats->{$b->{'did_number'}}->{'performance_score'}
+            <=> $stats->{$a->{'did_number'}}->{'performance_score'}
+        || $a->{'did_id'} <=> $b->{'did_id'}
+    } @high_performers;
+
+    my $selected = $high_performers[0];
+    my $reason = $used_local_pool
+        ? 'HIGH_PERFORMING_LOCAL_LRU'
+        : 'HIGH_PERFORMING_CAMPAIGN_LRU';
+
+    return ($selected, {
+        reason             => $reason,
+        used_local_pool    => $used_local_pool,
+        previous_excluded  => $previous_excluded,
+        candidate_count    => scalar(@pool),
+        high_performer_count => scalar(@high_performers),
+        best_score          => $best_score,
+        geo_match_rank      => $best_geo_rank,
+    });
+}
+
+sub select_and_record {
+    my ($db, $call) = @_;
+    my $campaign = $call->{'campaign_id'};
+    my $destination_npanxx = get_npanxx($call->{'destination'});
+    my $destination_local_key = $destination_npanxx
+        ? substr($destination_npanxx, 0, 3)
+        : '';
+
+    # Historical statistics are intentionally loaded before the lock so that
+    # the per-campaign transaction stays short.
+    my $initial = get_preferred_candidate_dids(
+        $db, $campaign, $destination_npanxx, $destination_local_key
+    );
+    abort_request('NO_DID', 'No enabled DID remains below its daily limit') unless @$initial;
+    my @initial_numbers = map { $_->{'did_number'} } @$initial;
+    my $geo_profiles = get_geo_profiles($db, [$call->{'destination'}, @initial_numbers]);
+    my $destination_profile = $geo_profiles->{$destination_npanxx};
+    my ($initial_geo_pool) = get_best_geo_pool($initial, $destination_profile, $geo_profiles);
+    my @scoring_numbers = map { $_->{'did_number'} } @$initial_geo_pool;
+    my $stats = get_completed_call_results($db, $campaign, \@scoring_numbers);
+    calculate_performance_scores($initial_geo_pool, $stats);
+    for my $candidate (@$initial_geo_pool) {
+        my $metric = $stats->{$candidate->{'did_number'}};
+        agi_verbose(
+            sprintf(
+                'candidate DID=%s npanxx=%s sample=%d human=%d good=%d raw_good=%.4f bayes_good=%.4f bayes_human=%.4f avg_answered=%.1f bayes_duration=%.1f reputation=%s score=%.4f',
+                $candidate->{'did_number'}, $candidate->{'npanxx'} || 'NONE',
+                $metric->{'sample_size'} || 0,
+                $metric->{'human_answered_calls'} || 0,
+                $metric->{'good_calls'} || 0,
+                $metric->{'good_call_rate'} || 0,
+                $metric->{'smoothed_good_call_rate'} || 0,
+                $metric->{'smoothed_human_answer_rate'} || 0,
+                $metric->{'average_answered_duration'} || 0,
+                $metric->{'smoothed_average_duration'} || 0,
+                $metric->{'reputation'} || 'Unknown',
+                $metric->{'performance_score'} || 0
+            ),
+            0
+        );
+    }
+
+    $db->begin_work();
+    $db->do(
+        q{INSERT IGNORE INTO did_optimizer_campaign_state (campaign_id)
+          VALUES (?)},
+        undef, $campaign
+    );
+    my ($previous_did) = $db->selectrow_array(
+        q{SELECT last_did FROM did_optimizer_campaign_state
+          WHERE campaign_id = ? FOR UPDATE},
+        undef, $campaign
+    );
+
+    # Idempotency: a repeated AGI execution for the same call reuses its first
+    # committed DID and never increments counters twice.
+    my $existing = $db->selectrow_hashref(
+        q{SELECT assignment_id, did_number, selection_reason
+          FROM did_optimizer_assignments
+          WHERE unique_call_id = ? FOR UPDATE},
+        undef, $call->{'unique_call_id'}
+    );
+    if ($existing) {
+        $db->commit();
+        my $existing_stats = $stats->{$existing->{'did_number'}} || {
+            sample_size => 0, human_answered_calls => 0, good_calls => 0,
+            human_answer_rate => 0, good_call_rate => 0,
+            average_answered_duration => 0,
+        };
+        return ({
+            did_id => undef,
+            did_number => $existing->{'did_number'},
+            npanxx => get_npanxx($existing->{'did_number'}),
+        }, $existing_stats, {
+            reason => 'IDEMPOTENT_REUSE', used_local_pool => 0,
+            previous_excluded => 0, candidate_count => 1, geo_match_rank => 0,
+            high_performer_count => 1,
+        }, $existing->{'assignment_id'});
+    }
+
+    # Recheck eligibility after acquiring the campaign-state lock. That lock
+    # already serializes optimizer selections for this campaign, so locking
+    # every eligible pool row here only increases contention across dialers.
+    # The conditional UPDATE below remains the final eligibility guard in case
+    # an administrator changes the selected pool row concurrently.
+    # Recheck only the candidates whose geography and performance were already
+    # loaded above. In particular, do not repeat the coordinate/centroid query
+    # while holding the campaign lock, and do not introduce unscored DIDs into
+    # the final decision.
+    my @scored_did_ids = map { $_->{'did_id'} } @$initial_geo_pool;
+    my $candidates = get_candidate_dids(
+        $db, $campaign, [], 0, \@scored_did_ids
+    );
+    abort_request('NO_DID', 'No eligible DID remained after transactional recheck')
+        unless @$candidates;
+
+    my ($selected, $decision) = choose_candidate(
+        $candidates, $stats, $previous_did, $destination_profile, $geo_profiles
+    );
+    abort_request('NO_DID', 'No DID could be selected') unless $selected;
+
+    my $insert = $db->prepare(q{
+        INSERT INTO did_optimizer_assignments
+            (unique_call_id, campaign_id, server_ip, lead_id, auto_call_id, did_number,
+             destination, selection_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    });
+    $insert->execute(
+        $call->{'unique_call_id'}, $campaign, $call->{'server_ip'}, $call->{'lead_id'},
+        $call->{'auto_call_id'}, $selected->{'did_number'},
+        $call->{'destination'}, $decision->{'reason'}
+    );
+    my $assignment_id = $db->{'mysql_insertid'};
+
+    my $updated = $db->do(q{
+        UPDATE did_optimizer_pool
+           SET calls_today = IF(usage_date = CURDATE(), calls_today + 1, 1),
+               usage_date = CURDATE(),
+               total_assignments = total_assignments + 1,
+               last_used = NOW()
+         WHERE did_id = ?
+           AND campaign_id = ?
+           AND enabled = 'Y'
+           AND (daily_limit = 0 OR
+                CASE WHEN usage_date = CURDATE() THEN calls_today ELSE 0 END < daily_limit)
+    }, undef, $selected->{'did_id'}, $campaign);
+    die 'Selected DID became ineligible during update' unless $updated && $updated == 1;
+
+    $db->do(q{
+        UPDATE did_optimizer_campaign_state
+           SET last_did = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE campaign_id = ?
+    }, undef, $selected->{'did_number'}, $campaign);
+
+    $db->commit();
+    return ($selected, $stats->{$selected->{'did_number'}}, $decision, $assignment_id);
+}
+
+sub publish_success_variables {
+    my ($call, $selected, $metrics, $decision, $destination_npanxx) = @_;
+    agi_set_variable('DIDOPT_STATUS', 'OK');
+    agi_set_variable('DIDOPT_SELECTED', $selected->{'did_number'});
+    agi_set_variable('DIDOPT_CAMPAIGN', $call->{'campaign_id'});
+    agi_set_variable('DIDOPT_SERVER_IP', $call->{'server_ip'});
+    agi_set_variable('DIDOPT_SCORE', sprintf('%.4f', $metrics->{'performance_score'} || 0));
+    agi_set_variable('DIDOPT_GOOD_CALLS', $metrics->{'good_calls'} || 0);
+    agi_set_variable('DIDOPT_SAMPLE_SIZE', $metrics->{'sample_size'} || 0);
+    agi_set_variable('DIDOPT_LOCAL_MATCH', $decision->{'used_local_pool'} ? $destination_npanxx : '');
+    agi_set_variable('DIDOPT_GEO_RANK', $decision->{'geo_match_rank'} || 0);
+    agi_set_variable('DIDOPT_REASON', $decision->{'reason'});
+}
+
+sub main {
+    my $agi = read_agi_environment();
+    my @args = @ARGV;
+
+    my $config = load_vicidial_config($CONFIG_FILE);
+    abort_request('NO_SERVER', "Missing VARserver_ip in $CONFIG_FILE")
+        unless defined $config->{'VARserver_ip'} && $config->{'VARserver_ip'} ne '';
+    $dbh = connect_database($config);
+    die 'Database connection returned no handle' unless $dbh;
+
+    my $call = find_current_call($dbh, $agi, \@args, $config->{'VARserver_ip'});
+    validate_call_context($call);
+    my $destination_npanxx = get_npanxx($call->{'destination'});
+
+    agi_verbose(
+        "server=$call->{'server_ip'} campaign=$call->{'campaign_id'} destination=$call->{'destination'} "
+        . "uniqueid=$call->{'unique_call_id'} source=$call->{'lookup_source'}",
+        0
+    );
+    agi_verbose("destination_npanxx=" . ($destination_npanxx || 'NONE'), 0);
+
+    my ($selected, $metrics, $decision, $assignment_id) =
+        select_and_record($dbh, $call);
+
+    agi_verbose(
+        sprintf(
+            'selected DID=%s sample=%d human=%d good=%d score=%.4f avg_answered=%.1f reason=%s',
+            $selected->{'did_number'}, $metrics->{'sample_size'} || 0,
+            $metrics->{'human_answered_calls'} || 0, $metrics->{'good_calls'} || 0,
+            $metrics->{'performance_score'} || 0,
+            $metrics->{'average_answered_duration'} || 0,
+            $decision->{'reason'}
+        ),
+        0
+    );
+    agi_verbose(
+        'selection local_pool=' . ($decision->{'used_local_pool'} ? 'Y' : 'N')
+        . ' geo_rank=' . ($decision->{'geo_match_rank'} || 0)
+        . ' previous_excluded=' . ($decision->{'previous_excluded'} ? 'Y' : 'N')
+        . ' candidates=' . ($decision->{'candidate_count'} || 0)
+        . ' high_performers=' . ($decision->{'high_performer_count'} || 0),
+        0
+    );
+
+    # Caller ID changes only after COMMIT. A channel mutation cannot be rolled
+    # back, while the committed assignment must remain the source of truth.
+    die 'Asterisk rejected CALLERID(num) update'
+        unless set_callerid($selected->{'did_number'});
+
+    if ($assignment_id) {
+        my $marked = eval {
+            $dbh->do(
+                q{UPDATE did_optimizer_assignments SET callerid_applied = 'Y'
+                  WHERE assignment_id = ?},
+                undef, $assignment_id
+            );
+            1;
+        };
+        # Caller ID is already active and cannot be rolled back. Treat this
+        # audit-marker update as best effort; an unmarked assignment is safely
+        # excluded from future performance samples.
+        agi_verbose('warning: callerid applied but audit marker update failed', 1)
+            unless $marked;
+    }
+
+    publish_success_variables($call, $selected, $metrics, $decision, $destination_npanxx);
+    agi_verbose("callerid committed DID=$selected->{'did_number'}", 0);
+    $dbh->disconnect();
+    $dbh = undef;
+    return 1;
+}
+
+my $ok = eval { main(); 1 };
+if (!$ok) {
+    my $error = $@ || 'Unknown error';
+    eval {
+        $dbh->rollback() if $dbh && !$dbh->{'AutoCommit'};
+    };
+
+    my ($status, $message) = ('ERROR', $error);
+    if ($error =~ /^DIDOPT_ABORT\|([^|]+)\|(.*?)(?:\n|$)/s) {
+        ($status, $message) = ($1, $2);
+    }
+    elsif ($error =~ /DBI|database|SQL|prepare|execute|connect/i) {
+        $status = 'DB_ERROR';
+    }
+    $message =~ s/[\r\n]+/ /g;
+    $message =~ s/\s+at\s+\S+\s+line\s+\d+.*$//;
+    $message = substr($message, 0, 180);
+    set_failure_status($status, $message);
+
+    eval { $dbh->disconnect() if $dbh; };
+    $dbh = undef;
+}
+
+# Always exit cleanly. Failures leave the pre-existing caller ID untouched and
+# allow the dialplan to continue to its normal Dial() application.
+exit 0;
