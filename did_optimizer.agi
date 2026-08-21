@@ -21,6 +21,7 @@ my $GOOD_RATE_WEIGHT     = 0.40;
 my $HUMAN_RATE_WEIGHT    = 0.24;
 my $DURATION_WEIGHT      = 0.16;
 my $REPUTATION_WEIGHT    = 0.20;
+my $DEADLOCK_MAX_ATTEMPTS = 4; # 1213 deadlock / 1205 lock wait timeout only.
 
 my $dbh;
 my $agi_ready = 0;
@@ -689,6 +690,25 @@ sub select_and_record {
             0
         );
     }
+
+    for (my $attempt = 1; ; $attempt++) {
+        my @result = eval {
+            select_and_record_txn($db, $campaign, $call, $stats, $destination_profile, $geo_profiles)
+        };
+        return @result if !$@;
+
+        my $error = $@;
+        my $errno = $db->err;
+        eval { $db->rollback() unless $db->{'AutoCommit'}; };
+        die $error
+            unless $errno && ($errno == 1213 || $errno == 1205) && $attempt < $DEADLOCK_MAX_ATTEMPTS;
+        agi_verbose("retrying campaign=$campaign after MySQL error $errno (attempt $attempt)", 1);
+        select(undef, undef, undef, 0.05 * $attempt);
+    }
+}
+
+sub select_and_record_txn {
+    my ($db, $campaign, $call, $stats, $destination_profile, $geo_profiles) = @_;
 
     $db->begin_work();
     $db->do(
